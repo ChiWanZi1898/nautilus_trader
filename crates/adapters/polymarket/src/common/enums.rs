@@ -230,6 +230,8 @@ impl<'de> Deserialize<'de> for PolymarketOrderStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
 pub enum PolymarketTradeStatus {
+    /// Matched by the CLOB but not yet broadcast to the settlement executor.
+    MatchedNotBroadcasted,
     /// Sent to the executor service for on-chain submission.
     Matched,
     /// Mined on-chain, no finality threshold yet.
@@ -252,7 +254,10 @@ impl PolymarketTradeStatus {
     /// Returns `true` while settlement can still succeed or fail.
     #[must_use]
     pub const fn is_pending_settlement(&self) -> bool {
-        matches!(self, Self::Matched | Self::Mined | Self::Retrying)
+        matches!(
+            self,
+            Self::MatchedNotBroadcasted | Self::Matched | Self::Mined | Self::Retrying
+        )
     }
 }
 
@@ -450,6 +455,14 @@ mod tests {
     #[rstest]
     fn test_trade_status_serde_screaming_snake() {
         assert_eq!(
+            serde_json::to_string(&PolymarketTradeStatus::MatchedNotBroadcasted).unwrap(),
+            "\"MATCHED_NOT_BROADCASTED\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PolymarketTradeStatus>("\"MATCHED_NOT_BROADCASTED\"").unwrap(),
+            PolymarketTradeStatus::MatchedNotBroadcasted
+        );
+        assert_eq!(
             serde_json::to_string(&PolymarketTradeStatus::Confirmed).unwrap(),
             "\"CONFIRMED\""
         );
@@ -547,6 +560,7 @@ mod tests {
 
     #[rstest]
     fn test_trade_status_is_finalized() {
+        assert!(!PolymarketTradeStatus::MatchedNotBroadcasted.is_finalized());
         assert!(!PolymarketTradeStatus::Mined.is_finalized());
         assert!(PolymarketTradeStatus::Confirmed.is_finalized());
         assert!(!PolymarketTradeStatus::Matched.is_finalized());
@@ -556,6 +570,7 @@ mod tests {
 
     #[rstest]
     fn test_trade_status_is_pending_settlement() {
+        assert!(PolymarketTradeStatus::MatchedNotBroadcasted.is_pending_settlement());
         assert!(PolymarketTradeStatus::Matched.is_pending_settlement());
         assert!(PolymarketTradeStatus::Mined.is_pending_settlement());
         assert!(PolymarketTradeStatus::Retrying.is_pending_settlement());

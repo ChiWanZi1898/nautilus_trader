@@ -1040,6 +1040,7 @@ mod tests {
     }
 
     #[rstest]
+    #[case(PolymarketTradeStatus::MatchedNotBroadcasted)]
     #[case(PolymarketTradeStatus::Matched)]
     #[case(PolymarketTradeStatus::Mined)]
     #[case(PolymarketTradeStatus::Retrying)]

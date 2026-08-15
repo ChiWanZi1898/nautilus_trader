@@ -1409,9 +1409,13 @@ mod tests {
     }
 
     #[rstest]
-    fn test_dispatch_matched_trade_emits_fill_and_failed_trade_voids_it() {
+    #[case(crate::common::enums::PolymarketTradeStatus::MatchedNotBroadcasted)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Matched)]
+    fn test_dispatch_matched_trade_emits_fill_and_failed_trade_voids_it(
+        #[case] provisional_status: crate::common::enums::PolymarketTradeStatus,
+    ) {
         let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
-        trade.status = crate::common::enums::PolymarketTradeStatus::Matched;
+        trade.status = provisional_status;
         let instrument = test_instrument();
         let token_instruments = AtomicMap::new();
         token_instruments.insert(trade.asset_id, instrument.clone());
