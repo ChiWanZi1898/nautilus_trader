@@ -235,6 +235,13 @@ pub struct GammaMarket {
     pub competitive: Option<f64>,
     /// Market category.
     pub category: Option<String>,
+    /// Display label used for one member of a grouped negative-risk event.
+    pub group_item_title: Option<String>,
+    /// Optional exact textual threshold used by grouped event members.
+    pub group_item_threshold: Option<String>,
+    /// Whether this market is the venue's synthetic negative-risk "other" member.
+    #[serde(rename = "negRiskOther")]
+    pub neg_risk_other: Option<bool>,
     /// Neg-risk market ID for CTF exchange interaction.
     #[serde(rename = "negRiskMarketID")]
     pub neg_risk_market_id: Option<String>,
@@ -275,6 +282,12 @@ pub struct GammaEvent {
     pub active: Option<bool>,
     pub closed: Option<bool>,
     pub archived: Option<bool>,
+    /// Whether the event is restricted by the venue frontend policy.
+    pub restricted: Option<bool>,
+    /// Whether the event advertises an enabled central-limit order book.
+    pub enable_order_book: Option<bool>,
+    /// Whether negative-risk conversion is enabled for the event.
+    pub enable_neg_risk: Option<bool>,
     #[serde(default)]
     pub markets: Vec<GammaMarket>,
     /// Event-level liquidity.
@@ -300,6 +313,9 @@ pub struct GammaEvent {
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
     pub game_id: Option<u64>,
+    /// Tags attached to the complete event container.
+    #[serde(default)]
+    pub tags: Vec<GammaTag>,
 }
 
 /// A tag from the Gamma API `GET /tags`.

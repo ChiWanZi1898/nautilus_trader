@@ -908,7 +908,10 @@ mod tests {
             enums::PolymarketOrderSide,
         },
         config::PolymarketDataClientConfig,
-        data_types::PolymarketFrameCommit,
+        data_types::{
+            POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketEventDefinitionSnapshot,
+            PolymarketFrameCommit,
+        },
         http::data_api::PolymarketDataApiHttpClient,
         resolve::{
             PolymarketResolveRequestSummaryData, RESOLVE_REQUEST_TYPE_NAME, ResolveBatchErrorMode,
@@ -2064,6 +2067,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestServerState {
         gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+        gamma_events_response: Arc<tokio::sync::Mutex<Option<Value>>>,
         clob_market_by_condition: Arc<tokio::sync::Mutex<AHashMap<String, Value>>>,
         market_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
         market_cache_probe: Arc<StdMutex<Option<CacheProbe>>>,
@@ -2083,6 +2087,16 @@ mod tests {
     async fn handle_gamma_markets_keyset(State(state): State<TestServerState>) -> Json<Value> {
         let Json(markets) = handle_gamma_markets(State(state)).await;
         Json(serde_json::json!({"markets": markets}))
+    }
+
+    async fn handle_gamma_events_keyset(State(state): State<TestServerState>) -> Json<Value> {
+        let events = state
+            .gamma_events_response
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_else(|| serde_json::json!([]));
+        Json(serde_json::json!({"events": events}))
     }
 
     async fn handle_clob_market(
@@ -2129,6 +2143,7 @@ mod tests {
         let router = Router::new()
             .route("/markets", get(handle_gamma_markets))
             .route("/markets/keyset", get(handle_gamma_markets_keyset))
+            .route("/events/keyset", get(handle_gamma_events_keyset))
             .route("/markets/{condition_id}", get(handle_clob_market))
             .route("/ws/market", get(handle_market_upgrade))
             .with_state(state);
@@ -2414,6 +2429,92 @@ mod tests {
             .get("0xCOND-BTC")
             .expect("expected watch entry restored after emit failure");
         assert_eq!(entry.tracked.len(), 2);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn request_data_returns_one_complete_canonical_event_definition_snapshot() {
+        let state = TestServerState::default();
+        *state.gamma_events_response.lock().await = Some(
+            serde_json::from_str(include_str!("../../test_data/gamma_event.json"))
+                .expect("Gamma event fixture"),
+        );
+        let addr = start_mock_server(state).await;
+        let (client, mut data_rx) = create_test_client(addr);
+        let request = RequestCustomData::new(
+            ClientId::from("POLYMARKET"),
+            DataType::new(POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, None, None),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+
+        client.request_data(request).expect("request_data");
+        let events = collect_events_until(&mut data_rx, StdDuration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                let DataEvent::Response(DataResponse::Data(response)) = event else {
+                    return false;
+                };
+                let Some(custom) = response.data.as_ref().downcast_ref::<ModelCustomData>() else {
+                    return false;
+                };
+                custom.data_type.type_name() == POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME
+            })
+        })
+        .await;
+        let snapshot = events
+            .iter()
+            .find_map(|event| {
+                let DataEvent::Response(DataResponse::Data(response)) = event else {
+                    return None;
+                };
+                let custom = response.data.as_ref().downcast_ref::<ModelCustomData>()?;
+                custom
+                    .data
+                    .as_any()
+                    .downcast_ref::<PolymarketEventDefinitionSnapshot>()
+            })
+            .expect("event definition response");
+
+        assert_eq!(snapshot.events().len(), 1);
+        assert_eq!(snapshot.events()[0].event_id(), "30829");
+        assert_eq!(snapshot.events()[0].markets().len(), 2);
+        assert!(
+            snapshot.events()[0]
+                .markets()
+                .windows(2)
+                .all(|markets| { markets[0].condition_id() < markets[1].condition_id() })
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn event_definition_request_rejects_unexecuted_filters() {
+        let state = TestServerState::default();
+        let addr = start_mock_server(state).await;
+        let (client, mut data_rx) = create_test_client(addr);
+        let mut params = Params::new();
+        params.insert("tag_slug".to_string(), Value::String("weather".to_string()));
+        let request = RequestCustomData::new(
+            ClientId::from("POLYMARKET"),
+            DataType::new(POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, None, None),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(params),
+        );
+
+        client.request_data(request).expect("request_data");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), data_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[rstest]

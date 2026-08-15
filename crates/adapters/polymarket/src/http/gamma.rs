@@ -44,6 +44,7 @@ use serde_json::Value;
 
 use crate::{
     common::urls::gamma_api_url,
+    data_types::PolymarketEventDefinition,
     http::{
         error::{Error, Result},
         models::{GammaEvent, GammaMarket, GammaTag, SearchResponse},
@@ -936,6 +937,30 @@ impl PolymarketGammaHttpClient {
         params: GetGammaEventsParams,
     ) -> anyhow::Result<Vec<GammaEvent>> {
         self.fetch_gamma_events_paginated(params).await
+    }
+
+    /// Fetches complete Gamma event containers and returns canonical immutable definitions.
+    ///
+    /// Unlike the instrument-only helpers, this preserves the event membership boundary and every
+    /// market member. Temperature eligibility and application topology generations remain owned by
+    /// the downstream topology catalog.
+    pub async fn request_event_definitions_by_params(
+        &self,
+        params: GetGammaEventsParams,
+    ) -> anyhow::Result<Vec<PolymarketEventDefinition>> {
+        let events = self.fetch_gamma_events_paginated(params).await?;
+        let mut definitions = events
+            .into_iter()
+            .map(PolymarketEventDefinition::try_from_gamma)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        definitions.sort_by(|a, b| a.event_id().cmp(b.event_id()));
+        anyhow::ensure!(
+            definitions
+                .windows(2)
+                .all(|events| events[0].event_id() != events[1].event_id()),
+            "Gamma returned duplicate event identifiers",
+        );
+        Ok(definitions)
     }
 
     /// Searches for instruments via the Gamma public search endpoint.

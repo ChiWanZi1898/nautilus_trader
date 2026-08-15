@@ -35,6 +35,10 @@ use super::{
 };
 use crate::{
     common::consts::POLYMARKET_VENUE,
+    data_types::{
+        POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketEventDefinitionSnapshot,
+    },
+    http::query::GetGammaEventsParams,
     providers::extract_condition_id,
     resolve::{
         PolymarketResolveRequestSummaryData, RESOLVE_REQUEST_TYPE_NAME, ResolveBatchErrorMode,
@@ -45,6 +49,11 @@ use crate::{
 };
 
 pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustomData) {
+    if request.data_type.type_name() == POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME {
+        request_event_definition_snapshot(client, request);
+        return;
+    }
+
     if request.data_type.type_name() != RESOLVE_REQUEST_TYPE_NAME {
         log::debug!(
             "Ignoring unsupported custom data request type: {}",
@@ -197,6 +206,81 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
 
         if let Err(e) = sender.send(DataEvent::Response(response)) {
             log::error!("Failed to send resolve custom data response: {e}");
+        }
+    });
+}
+
+fn request_event_definition_snapshot(client: &PolymarketDataClient, request: RequestCustomData) {
+    if request.start.is_some()
+        || request.end.is_some()
+        || request.limit.is_some()
+        || request
+            .params
+            .as_ref()
+            .is_some_and(|params| !params.is_empty())
+    {
+        log::error!(
+            "Polymarket event definition snapshots require an unfiltered full-universe request"
+        );
+        return;
+    }
+
+    let RequestCustomData {
+        data_type,
+        request_id,
+        client_id,
+        params: request_params,
+        start,
+        end,
+        ..
+    } = request;
+    let gamma_client = client.provider.http_client().clone();
+    let sender = client.data_sender.clone();
+    let clock = client.clock;
+    let start_nanos = datetime_to_unix_nanos(start);
+    let end_nanos = datetime_to_unix_nanos(end);
+
+    get_runtime().spawn(async move {
+        let params = GetGammaEventsParams {
+            active: Some(true),
+            closed: Some(false),
+            archived: Some(false),
+            max_events: Some(10_001),
+            ..Default::default()
+        };
+        let definitions = match gamma_client
+            .request_event_definitions_by_params(params)
+            .await
+        {
+            Ok(definitions) => definitions,
+            Err(error) => {
+                log::error!("Failed to request complete Polymarket event definitions: {error}");
+                return;
+            }
+        };
+        let ts_now = clock.get_time_ns();
+        let snapshot = match PolymarketEventDefinitionSnapshot::try_new(definitions, ts_now) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!("Invalid complete Polymarket event definition snapshot: {error}");
+                return;
+            }
+        };
+        let payload = Arc::new(snapshot);
+        let custom = CustomData::new(payload, data_type.clone());
+        let response = DataResponse::Data(CustomDataResponse::new(
+            request_id,
+            client_id,
+            Some(*POLYMARKET_VENUE),
+            data_type,
+            custom,
+            start_nanos,
+            end_nanos,
+            ts_now,
+            request_params,
+        ));
+        if let Err(error) = sender.send(DataEvent::Response(response)) {
+            log::error!("Failed to send Polymarket event definition snapshot: {error}");
         }
     });
 }
