@@ -27,6 +27,7 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_persistence_macros::custom_data;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::http::models::{GammaEvent, GammaMarket, GammaTag};
@@ -447,6 +448,45 @@ pub struct PolymarketEventMarketDefinition {
     neg_risk_other: Option<bool>,
     group_item_title: Option<String>,
     group_item_threshold: Option<String>,
+    price_tick: Option<String>,
+    minimum_order_size: Option<String>,
+    fees_enabled: Option<bool>,
+    fee_schedule: Option<PolymarketFeeScheduleDefinition>,
+}
+
+/// Exact public fee schedule retained from one Gamma market definition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketFeeScheduleDefinition {
+    rate: String,
+    exponent: String,
+    taker_only: bool,
+    rebate_rate: String,
+}
+
+impl PolymarketFeeScheduleDefinition {
+    /// Returns the exact normalized fee-curve rate.
+    #[must_use]
+    pub fn rate(&self) -> &str {
+        &self.rate
+    }
+
+    /// Returns the exact normalized fee-curve exponent.
+    #[must_use]
+    pub fn exponent(&self) -> &str {
+        &self.exponent
+    }
+
+    /// Returns whether the venue declares the schedule taker-only.
+    #[must_use]
+    pub const fn taker_only(&self) -> bool {
+        self.taker_only
+    }
+
+    /// Returns the exact normalized maker-rebate rate.
+    #[must_use]
+    pub fn rebate_rate(&self) -> &str {
+        &self.rebate_rate
+    }
 }
 
 impl PolymarketEventMarketDefinition {
@@ -544,6 +584,30 @@ impl PolymarketEventMarketDefinition {
     #[must_use]
     pub fn group_item_threshold(&self) -> Option<&str> {
         self.group_item_threshold.as_deref()
+    }
+
+    /// Returns the exact normalized minimum price increment.
+    #[must_use]
+    pub fn price_tick(&self) -> Option<&str> {
+        self.price_tick.as_deref()
+    }
+
+    /// Returns the exact normalized minimum order size.
+    #[must_use]
+    pub fn minimum_order_size(&self) -> Option<&str> {
+        self.minimum_order_size.as_deref()
+    }
+
+    /// Returns whether Gamma marks fees enabled for this market.
+    #[must_use]
+    pub const fn fees_enabled(&self) -> Option<bool> {
+        self.fees_enabled
+    }
+
+    /// Returns the exact public fee schedule when supplied.
+    #[must_use]
+    pub const fn fee_schedule(&self) -> Option<&PolymarketFeeScheduleDefinition> {
+        self.fee_schedule.as_ref()
     }
 }
 
@@ -776,7 +840,6 @@ impl PolymarketEventMarketDefinition {
             "market.group_item_threshold",
             market.group_item_threshold.as_deref(),
         )?;
-
         let outcomes = parse_embedded_string_array("outcomes", &market.outcomes)?;
         let token_ids = parse_embedded_string_array("clob_token_ids", &market.clob_token_ids)?;
         anyhow::ensure!(
@@ -791,6 +854,37 @@ impl PolymarketEventMarketDefinition {
         );
         ensure_unique_strings(&outcomes, "market outcome")?;
         ensure_unique_strings(&token_ids, "market token id")?;
+
+        let price_tick = market
+            .order_price_min_tick_size
+            .as_ref()
+            .map(|value| canonical_decimal("market.price_tick", value))
+            .transpose()?;
+        let minimum_order_size = market
+            .order_min_size
+            .as_ref()
+            .map(|value| canonical_decimal("market.minimum_order_size", value))
+            .transpose()?;
+        let fee_schedule = market
+            .fee_schedule
+            .as_ref()
+            .map(
+                |schedule| -> anyhow::Result<PolymarketFeeScheduleDefinition> {
+                    Ok(PolymarketFeeScheduleDefinition {
+                        rate: canonical_decimal("market.fee_schedule.rate", &schedule.rate)?,
+                        exponent: canonical_decimal(
+                            "market.fee_schedule.exponent",
+                            &schedule.exponent,
+                        )?,
+                        taker_only: schedule.taker_only,
+                        rebate_rate: canonical_decimal(
+                            "market.fee_schedule.rebate_rate",
+                            &schedule.rebate_rate,
+                        )?,
+                    })
+                },
+            )
+            .transpose()?;
 
         Ok(Self {
             market_id: market.id,
@@ -809,8 +903,24 @@ impl PolymarketEventMarketDefinition {
             neg_risk_other: market.neg_risk_other,
             group_item_title: normalize_optional_text(market.group_item_title),
             group_item_threshold: normalize_optional_text(market.group_item_threshold),
+            price_tick,
+            minimum_order_size,
+            fees_enabled: market.fees_enabled,
+            fee_schedule,
         })
     }
+}
+
+fn canonical_decimal(
+    field: &str,
+    value: &crate::http::models::GammaDecimal,
+) -> anyhow::Result<String> {
+    let parsed: Decimal = value
+        .as_str()
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))?;
+    anyhow::ensure!(!parsed.is_sign_negative(), "{field} must be non-negative");
+    Ok(parsed.normalize().to_string())
 }
 
 /// Canonical response to a complete active-event definition request.
@@ -1008,6 +1118,28 @@ fn validate_event_definition(event: &PolymarketEventDefinition) -> anyhow::Resul
             "market.group_item_threshold",
             market.group_item_threshold.as_deref(),
         )?;
+        if let Some(price_tick) = &market.price_tick {
+            anyhow::ensure!(
+                !validate_canonical_decimal("market.price_tick", price_tick)?.is_zero(),
+                "market.price_tick must be positive",
+            );
+        }
+        if let Some(minimum_order_size) = &market.minimum_order_size {
+            anyhow::ensure!(
+                !validate_canonical_decimal("market.minimum_order_size", minimum_order_size)?
+                    .is_zero(),
+                "market.minimum_order_size must be positive",
+            );
+        }
+        if let Some(schedule) = &market.fee_schedule {
+            validate_canonical_decimal("market.fee_schedule.rate", &schedule.rate)?;
+            anyhow::ensure!(
+                !validate_canonical_decimal("market.fee_schedule.exponent", &schedule.exponent,)?
+                    .is_zero(),
+                "market.fee_schedule.exponent must be positive",
+            );
+            validate_canonical_decimal("market.fee_schedule.rebate_rate", &schedule.rebate_rate)?;
+        }
         anyhow::ensure!(
             market.outcomes.len() <= MAX_MARKET_OUTCOMES
                 && market.token_ids.len() <= MAX_MARKET_OUTCOMES,
@@ -1081,6 +1213,18 @@ fn validate_optional_text(field: &str, value: Option<&str>) -> anyhow::Result<()
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
+}
+
+fn validate_canonical_decimal(field: &str, value: &str) -> anyhow::Result<Decimal> {
+    let parsed: Decimal = value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {field}: {error}"))?;
+    anyhow::ensure!(!parsed.is_sign_negative(), "{field} must be non-negative");
+    anyhow::ensure!(
+        parsed.normalize().to_string() == value,
+        "{field} is not canonical"
+    );
+    Ok(parsed)
 }
 
 fn ensure_unique_strings(values: &[String], field: &str) -> anyhow::Result<()> {
@@ -1176,7 +1320,7 @@ mod tests {
         PolymarketEventDefinition, PolymarketEventDefinitionSnapshot,
         register_polymarket_custom_data,
     };
-    use crate::http::models::GammaEvent;
+    use crate::http::models::{FeeSchedule, GammaEvent};
 
     fn gamma_events() -> Vec<GammaEvent> {
         serde_json::from_str(include_str!("../test_data/gamma_event.json"))
@@ -1213,6 +1357,32 @@ mod tests {
             (markets[0].condition_id(), markets[0].market_id())
                 < (markets[1].condition_id(), markets[1].market_id())
         }));
+        let first_market = &first.markets()[0];
+        assert_eq!(first_market.price_tick(), Some("0.001"));
+        assert_eq!(first_market.minimum_order_size(), Some("5"));
+        assert_eq!(first_market.fees_enabled(), Some(false));
+        assert!(first_market.fee_schedule().is_none());
+    }
+
+    #[rstest]
+    fn event_definition_retains_exact_normalized_fee_schedule() {
+        let mut event = gamma_events().remove(0);
+        event.markets[0].fees_enabled = Some(true);
+        event.markets[0].fee_schedule = Some(FeeSchedule {
+            rate: "0.0500".parse().expect("rate"),
+            exponent: "1.000".parse().expect("exponent"),
+            taker_only: true,
+            rebate_rate: "0.2500".parse().expect("rebate rate"),
+        });
+
+        let definition = PolymarketEventDefinition::try_from_gamma(event).expect("definition");
+        let schedule = definition.markets()[0]
+            .fee_schedule()
+            .expect("fee schedule");
+        assert_eq!(schedule.rate(), "0.05");
+        assert_eq!(schedule.exponent(), "1");
+        assert!(schedule.taker_only());
+        assert_eq!(schedule.rebate_rate(), "0.25");
     }
 
     #[rstest]
@@ -1274,6 +1444,14 @@ mod tests {
             .reverse();
         assert!(
             <PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(malformed).is_err()
+        );
+
+        let mut invalid_tick =
+            serde_json::from_str::<serde_json::Value>(&json).expect("JSON value");
+        invalid_tick["events"][0]["markets"][0]["price_tick"] = serde_json::json!("0");
+        assert!(
+            <PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(invalid_tick)
+                .is_err()
         );
 
         let mut mismatched_time =

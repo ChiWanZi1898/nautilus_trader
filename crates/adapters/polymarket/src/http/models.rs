@@ -16,7 +16,8 @@
 //! HTTP REST model types for the Polymarket CLOB API.
 
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use serde_json::value::RawValue;
 use ustr::Ustr;
 
 use crate::common::{
@@ -184,13 +185,15 @@ pub struct GammaMarket {
     /// Whether order book trading is enabled.
     pub enable_order_book: Option<bool>,
     /// Minimum price increment.
-    pub order_price_min_tick_size: Option<f64>,
+    pub order_price_min_tick_size: Option<GammaDecimal>,
     /// Minimum order size.
-    pub order_min_size: Option<f64>,
+    pub order_min_size: Option<GammaDecimal>,
     /// Maker fee in basis points.
     pub maker_base_fee: Option<i64>,
     /// Taker fee in basis points.
     pub taker_base_fee: Option<i64>,
+    /// Whether this market advertises protocol taker fees.
+    pub fees_enabled: Option<bool>,
     /// URL slug.
     #[serde(rename = "slug")]
     pub market_slug: Option<String>,
@@ -259,10 +262,64 @@ pub struct GammaMarket {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeSchedule {
-    pub exponent: f64,
-    pub rate: f64,
+    pub exponent: GammaDecimal,
+    pub rate: GammaDecimal,
     pub taker_only: bool,
-    pub rebate_rate: f64,
+    pub rebate_rate: GammaDecimal,
+}
+
+/// One exact JSON number lexeme retained from Gamma without floating-point conversion.
+#[derive(Clone, Debug)]
+pub struct GammaDecimal(Box<RawValue>);
+
+impl GammaDecimal {
+    /// Returns the exact JSON number text.
+    pub fn as_str(&self) -> &str {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for GammaDecimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for GammaDecimal {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<Decimal>()
+            .map_err(|error| anyhow::anyhow!("invalid Gamma decimal: {error}"))?;
+        Ok(Self(RawValue::from_string(value.to_string())?))
+    }
+}
+
+impl PartialEq for GammaDecimal {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Serialize for GammaDecimal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for GammaDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        raw.get().parse::<Decimal>().map_err(D::Error::custom)?;
+        Ok(Self(raw))
+    }
 }
 
 /// An event response from the Gamma API `GET /events`.

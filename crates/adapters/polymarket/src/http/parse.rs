@@ -114,7 +114,8 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
 
     let tick_size_str = market
         .order_price_min_tick_size
-        .map_or_else(|| DEFAULT_TICK_SIZE.to_string(), |ts| ts.to_string());
+        .as_ref()
+        .map_or_else(|| DEFAULT_TICK_SIZE.to_string(), ToString::to_string);
     let tick_size: Decimal = tick_size_str
         .parse()
         .map_err(|e| anyhow::anyhow!("Failed to parse tick size '{tick_size_str}': {e}"))?;
@@ -127,11 +128,14 @@ pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<Polymarket
     let taker_fee: Option<Decimal> = market
         .fee_schedule
         .as_ref()
-        .and_then(|fs| Decimal::try_from(fs.rate).ok());
+        .map(|fs| fs.rate.as_str().parse())
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("Failed to parse fee schedule rate: {e}"))?;
 
     let min_size: Option<Decimal> = market
         .order_min_size
-        .map(|s| s.to_string().parse())
+        .as_ref()
+        .map(|size| size.to_string().parse())
         .transpose()
         .map_err(|e| anyhow::anyhow!("Failed to parse min size: {e}"))?;
 
@@ -697,7 +701,7 @@ mod tests {
         #[case] expected_precision: u8,
     ) {
         let mut market = load_gamma_market("gamma_market.json");
-        market.order_price_min_tick_size = Some(tick_size);
+        market.order_price_min_tick_size = Some(tick_size.to_string().parse().unwrap());
         let defs = parse_gamma_market(&market).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 
@@ -721,7 +725,7 @@ mod tests {
         // venue's [tick, 1 - tick] range that `validate_limit_price` enforces, and the old
         // static 0.001/0.999 bounds must be rejected by that same validation.
         let mut market = load_gamma_market("gamma_market.json");
-        market.order_price_min_tick_size = Some(0.01);
+        market.order_price_min_tick_size = Some("0.01".parse().unwrap());
         let defs = parse_gamma_market(&market).unwrap();
         let ts_init = UnixNanos::from(1_000_000_000u64);
 

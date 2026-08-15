@@ -13,6 +13,8 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+#![recursion_limit = "256"]
+
 use nautilus_model::data::custom::CustomDataTrait;
 use nautilus_polymarket::data_types::{
     POLYMARKET_BOOK_READINESS_TYPE_NAME, POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME,
@@ -117,7 +119,16 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
                     "neg_risk_market_id": "neg-risk-1",
                     "neg_risk_other": false,
                     "group_item_title": "20C",
-                    "group_item_threshold": "20"
+                    "group_item_threshold": "20",
+                    "price_tick": "0.001",
+                    "minimum_order_size": "5",
+                    "fees_enabled": true,
+                    "fee_schedule": {
+                        "rate": "0.05",
+                        "exponent": "1",
+                        "taker_only": true,
+                        "rebate_rate": "0.25"
+                    }
                 }]
             }],
             "ts_event": 42,
@@ -134,4 +145,13 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
         snapshot.events()[0].markets()[0].token_ids(),
         ["yes-token", "no-token"]
     );
+    let market = &snapshot.events()[0].markets()[0];
+    assert_eq!(market.price_tick(), Some("0.001"));
+    assert_eq!(market.minimum_order_size(), Some("5"));
+    assert_eq!(market.fees_enabled(), Some(true));
+    let schedule = market.fee_schedule().expect("public fee schedule");
+    assert_eq!(schedule.rate(), "0.05");
+    assert_eq!(schedule.exponent(), "1");
+    assert!(schedule.taker_only());
+    assert_eq!(schedule.rebate_rate(), "0.25");
 }
