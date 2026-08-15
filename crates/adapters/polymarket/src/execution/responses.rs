@@ -40,6 +40,146 @@ use super::{
 };
 use crate::http::query::OrderResponse;
 
+const UNATTRIBUTED_BATCH_REJECTION: &str =
+    "Batch response explicitly rejected order without identifying rejected legs";
+
+#[derive(Debug)]
+enum BatchLegCorrelation {
+    Response(OrderResponse),
+    Rejected(String),
+    Unknown(String),
+}
+
+#[derive(Debug)]
+struct BatchResponseCorrelation {
+    legs: Vec<BatchLegCorrelation>,
+    issues: Vec<String>,
+}
+
+fn order_responses_are_identical(left: &OrderResponse, right: &OrderResponse) -> bool {
+    left.success == right.success
+        && left.order_id == right.order_id
+        && left.error_msg == right.error_msg
+}
+
+fn correlate_batch_responses(
+    responses: Vec<OrderResponse>,
+    expected_venue_order_ids: &[VenueOrderId],
+) -> BatchResponseCorrelation {
+    let response_len = responses.len();
+    let expected_len = expected_venue_order_ids.len();
+    let mut keyed: Vec<Option<OrderResponse>> = vec![None; expected_len];
+    let mut contradictory = vec![false; expected_len];
+    let mut unkeyed_rejections = Vec::new();
+    let mut issues = Vec::new();
+    let mut unkeyed_ambiguous = 0usize;
+
+    if response_len != expected_len {
+        issues.push(format!(
+            "response cardinality {response_len} does not match expected cardinality {expected_len}"
+        ));
+    }
+
+    for response in responses {
+        let returned_id = response
+            .order_id
+            .as_deref()
+            .filter(|order_id| !order_id.is_empty());
+
+        if let Some(returned_id) = returned_id {
+            let matches = expected_venue_order_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(index, expected)| (expected.as_str() == returned_id).then_some(index))
+                .collect::<Vec<_>>();
+
+            match matches.as_slice() {
+                [] => issues.push(format!("unknown returned order ID {returned_id}")),
+                [index] => {
+                    if contradictory[*index] {
+                        issues.push(format!(
+                            "additional response for contradictory returned order ID {returned_id}"
+                        ));
+                    } else if let Some(existing) = &keyed[*index] {
+                        if order_responses_are_identical(existing, &response) {
+                            issues.push(format!(
+                                "duplicate identical returned order ID {returned_id}"
+                            ));
+                        } else {
+                            issues.push(format!(
+                                "contradictory responses for returned order ID {returned_id}"
+                            ));
+                            keyed[*index] = None;
+                            contradictory[*index] = true;
+                        }
+                    } else {
+                        keyed[*index] = Some(response);
+                    }
+                }
+                _ => issues.push(format!("expected order ID {returned_id} is not unique")),
+            }
+        } else if !response.success
+            || response
+                .error_msg
+                .as_deref()
+                .is_some_and(|reason| !reason.is_empty())
+        {
+            unkeyed_rejections.push(response);
+        } else {
+            unkeyed_ambiguous += 1;
+            issues
+                .push("successful response omitted both order ID and rejection reason".to_string());
+        }
+    }
+
+    let unmatched = keyed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, response)| response.is_none().then_some(index))
+        .collect::<Vec<_>>();
+    let can_eliminate_rejections =
+        issues.is_empty() && unkeyed_ambiguous == 0 && unkeyed_rejections.len() == unmatched.len();
+
+    let mut legs = keyed
+        .into_iter()
+        .map(|response| response.map(BatchLegCorrelation::Response))
+        .collect::<Vec<_>>();
+
+    if can_eliminate_rejections {
+        if unmatched.len() == 1 {
+            legs[unmatched[0]] = Some(BatchLegCorrelation::Response(
+                unkeyed_rejections.pop().expect("length checked"),
+            ));
+        } else {
+            for index in unmatched {
+                legs[index] = Some(BatchLegCorrelation::Rejected(
+                    UNATTRIBUTED_BATCH_REJECTION.to_string(),
+                ));
+            }
+        }
+    } else if !unkeyed_rejections.is_empty() {
+        issues.push(format!(
+            "{} unkeyed rejection response(s) could not be assigned",
+            unkeyed_rejections.len()
+        ));
+    }
+
+    let unknown_reason = if issues.is_empty() {
+        "batch response did not resolve expected order".to_string()
+    } else {
+        format!(
+            "batch response correlation incomplete: {}",
+            issues.join("; ")
+        )
+    };
+    let legs = legs
+        .into_iter()
+        .map(|leg| leg.unwrap_or_else(|| BatchLegCorrelation::Unknown(unknown_reason.clone())))
+        .collect();
+
+    BatchResponseCorrelation { legs, issues }
+}
+
 #[expect(clippy::too_many_arguments)]
 pub(super) async fn handle_batch_order_responses(
     responses: Vec<OrderResponse>,
@@ -55,44 +195,62 @@ pub(super) async fn handle_batch_order_responses(
     pending_tasks: &Arc<TaskHandles>,
     account_id: AccountId,
 ) {
-    let response_len = responses.len();
-    let order_len = batch_orders.len();
-
-    if response_len != order_len {
-        log::warn!(
-            "Batch submit response length ({response_len}) does not match order count ({order_len})"
+    let internal_mismatch = batch_orders.len() != expected_venue_order_ids.len();
+    let correlation = if internal_mismatch {
+        let reason = format!(
+            "internal batch correlation mismatch: {} orders but {} expected IDs",
+            batch_orders.len(),
+            expected_venue_order_ids.len()
         );
+        BatchResponseCorrelation {
+            legs: (0..expected_venue_order_ids.len())
+                .map(|_| BatchLegCorrelation::Unknown(reason.clone()))
+                .collect(),
+            issues: vec![reason],
+        }
+    } else {
+        correlate_batch_responses(responses, &expected_venue_order_ids)
+    };
+    for issue in &correlation.issues {
+        log::warn!("Batch submit response correlation issue: {issue}");
     }
-
     let mut deferred = Vec::new();
 
-    for (batch_order, response) in batch_orders.iter().zip(responses) {
-        if let Some((order_id_str, venue_order_id)) = handle_order_response(
-            Ok(response),
-            &batch_order.order,
-            emitter,
-            clock,
-            fill_tracker,
-            order_identities,
-            pending_cancels,
-            account_id,
-            batch_order.size_precision,
-            batch_order.price_precision,
-        ) {
-            deferred.push((batch_order.order.clone(), order_id_str, venue_order_id));
-        }
-    }
-
-    if order_len > response_len {
-        for (batch_order, expected_venue_order_id) in batch_orders
-            .iter()
-            .zip(expected_venue_order_ids)
-            .skip(response_len)
-        {
-            if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
+    let mut legs = correlation.legs.into_iter();
+    for (index, batch_order) in batch_orders.iter().enumerate() {
+        let Some(expected_venue_order_id) = expected_venue_order_ids.get(index).copied() else {
+            log::error!(
+                "Cannot track unresolved batch order {} because its expected signed ID is missing",
+                batch_order.order.client_order_id()
+            );
+            continue;
+        };
+        let leg = legs.next().unwrap_or_else(|| {
+            BatchLegCorrelation::Unknown(
+                "internal batch correlation omitted expected leg".to_string(),
+            )
+        });
+        let deferred_cancel = match leg {
+            BatchLegCorrelation::Response(response) => handle_order_response(
+                Ok(response),
+                &batch_order.order,
+                emitter,
+                clock,
+                fill_tracker,
+                order_identities,
+                pending_cancels,
+                account_id,
+                batch_order.size_precision,
+                batch_order.price_precision,
+            ),
+            BatchLegCorrelation::Rejected(reason) => {
+                reject_submit_order(&batch_order.order, &reason, emitter, clock, pending_cancels);
+                None
+            }
+            BatchLegCorrelation::Unknown(reason) => handle_unknown_submit_result(
                 &batch_order.order,
                 expected_venue_order_id,
-                "batch response omitted order",
+                &reason,
                 None,
                 emitter,
                 clock,
@@ -103,9 +261,11 @@ pub(super) async fn handle_batch_order_responses(
                 account_id,
                 batch_order.size_precision,
                 batch_order.price_precision,
-            ) {
-                deferred.push((batch_order.order.clone(), order_id_str, venue_order_id));
-            }
+            ),
+        };
+
+        if let Some((order_id_str, venue_order_id)) = deferred_cancel {
+            deferred.push((batch_order.order.clone(), order_id_str, venue_order_id));
         }
     }
 
@@ -849,6 +1009,127 @@ mod tests {
             messages::{PolymarketUserOrder, PolymarketUserTrade, UserWsMessage},
         },
     };
+
+    fn batch_response(
+        success: bool,
+        order_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> OrderResponse {
+        OrderResponse {
+            success,
+            order_id: order_id.map(ToString::to_string),
+            error_msg: reason.map(ToString::to_string),
+        }
+    }
+
+    fn expected_batch_ids() -> Vec<VenueOrderId> {
+        vec![
+            VenueOrderId::from("expected-a"),
+            VenueOrderId::from("expected-b"),
+        ]
+    }
+
+    fn correlation_codes(correlation: &BatchResponseCorrelation) -> Vec<String> {
+        correlation
+            .legs
+            .iter()
+            .map(|leg| match leg {
+                BatchLegCorrelation::Response(response) if response.success => {
+                    response.order_id.clone().unwrap_or_default()
+                }
+                BatchLegCorrelation::Response(response) => format!(
+                    "rejected:{}",
+                    response.error_msg.as_deref().unwrap_or("unknown error")
+                ),
+                BatchLegCorrelation::Rejected(_) => "rejected:unattributed".to_string(),
+                BatchLegCorrelation::Unknown(_) => "unknown".to_string(),
+            })
+            .collect()
+    }
+
+    #[rstest]
+    #[case::reordered("reordered", ["expected-a", "expected-b"], None)]
+    #[case::short("short", ["unknown", "expected-b"], Some("cardinality"))]
+    #[case::duplicate_identical(
+        "duplicate",
+        ["expected-a", "unknown"],
+        Some("duplicate identical")
+    )]
+    #[case::duplicate_contradictory(
+        "contradictory",
+        ["unknown", "unknown"],
+        Some("contradictory")
+    )]
+    #[case::unknown_id("unknown", ["expected-a", "unknown"], Some("unknown returned"))]
+    #[case::mixed_rejection(
+        "mixed",
+        ["rejected:insufficient balance", "expected-b"],
+        None
+    )]
+    fn test_batch_correlation_permutations(
+        #[case] kind: &str,
+        #[case] expected_codes: [&str; 2],
+        #[case] issue: Option<&str>,
+    ) {
+        let responses = match kind {
+            "reordered" => vec![
+                batch_response(true, Some("expected-b"), None),
+                batch_response(true, Some("expected-a"), None),
+            ],
+            "short" => vec![batch_response(true, Some("expected-b"), None)],
+            "duplicate" => vec![
+                batch_response(true, Some("expected-a"), None),
+                batch_response(true, Some("expected-a"), None),
+            ],
+            "contradictory" => vec![
+                batch_response(true, Some("expected-a"), None),
+                batch_response(false, Some("expected-a"), Some("rejected")),
+            ],
+            "unknown" => vec![
+                batch_response(true, Some("expected-a"), None),
+                batch_response(true, Some("unknown"), None),
+            ],
+            "mixed" => vec![
+                batch_response(false, None, Some("insufficient balance")),
+                batch_response(true, Some("expected-b"), None),
+            ],
+            other => panic!("unknown case {other}"),
+        };
+        let correlation = correlate_batch_responses(responses, &expected_batch_ids());
+
+        assert_eq!(correlation_codes(&correlation), expected_codes);
+        match issue {
+            Some(issue) => assert!(correlation.issues.iter().any(|value| value.contains(issue))),
+            None => assert!(correlation.issues.is_empty()),
+        }
+    }
+
+    #[rstest]
+    fn test_batch_correlation_multiple_unkeyed_rejections_are_not_positionally_attributed() {
+        let expected = vec![
+            VenueOrderId::from("expected-a"),
+            VenueOrderId::from("expected-b"),
+            VenueOrderId::from("expected-c"),
+        ];
+        let correlation = correlate_batch_responses(
+            vec![
+                batch_response(false, None, Some("reason-a")),
+                batch_response(true, Some("expected-c"), None),
+                batch_response(false, None, Some("reason-b")),
+            ],
+            &expected,
+        );
+
+        assert_eq!(
+            correlation_codes(&correlation),
+            [
+                "rejected:unattributed",
+                "rejected:unattributed",
+                "expected-c"
+            ]
+        );
+        assert!(correlation.issues.is_empty());
+    }
 
     fn load<T: serde::de::DeserializeOwned>(filename: &str) -> T {
         let path = format!("test_data/{filename}");

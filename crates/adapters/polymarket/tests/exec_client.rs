@@ -497,17 +497,16 @@ async fn handle_post_orders(
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    let post_count = {
+    {
         let mut count = state.batch_order_post_count.lock().await;
         *count += 1;
-        *count
-    };
+    }
 
     let parsed = serde_json::from_slice::<Value>(&body).ok();
-    let request_count = parsed
+    let expected_order_ids = parsed
         .as_ref()
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len);
+        .map(expected_batch_order_ids)
+        .unwrap_or_default();
 
     if let Some(v) = parsed {
         *state.last_body.lock().await = Some(v);
@@ -517,25 +516,69 @@ async fn handle_post_orders(
 
     let status = *state.batch_order_response_status.lock().await;
     let resp = state.batch_order_response.lock().await;
-    let body = resp.clone().unwrap_or_else(|| {
-        // Namespace by POST count so order IDs are globally unique across chunks, matching the
-        // venue (each order receives a distinct ID); a per-chunk index alone would collide.
-        let entries: Vec<Value> = (0..request_count.max(1))
-            .map(|i| {
+    let mut body = resp.clone().unwrap_or_else(|| {
+        let entries: Vec<Value> = expected_order_ids
+            .iter()
+            .map(|expected_order_id| {
                 json!({
                     "success": true,
-                    "orderID": format!("0xauto-{post_count}-{i}"),
+                    "orderID": expected_order_id,
                     "errorMsg": ""
                 })
             })
             .collect();
         Value::Array(entries)
     });
+    resolve_mock_batch_response_ids(&mut body, &expected_order_ids);
 
     if let Some(responses) = body.as_array() {
         record_open_order_ids(&state, responses).await;
     }
     (status, Json(body)).into_response()
+}
+
+fn expected_batch_order_ids(request: &Value) -> Vec<String> {
+    request
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("order"))
+        .filter_map(|order| serde_json::from_value::<PolymarketOrder>(order.clone()).ok())
+        .filter_map(|order| order_hash(&order, false).ok())
+        .map(|hash| format!("{hash:#x}"))
+        .collect()
+}
+
+fn resolve_mock_batch_response_ids(body: &mut Value, expected_order_ids: &[String]) {
+    let Some(responses) = body.as_array_mut() else {
+        return;
+    };
+
+    for (response_index, response) in responses.iter_mut().enumerate() {
+        let Some(returned_id) = response
+            .get("orderID")
+            .and_then(Value::as_str)
+            .filter(|order_id| !order_id.is_empty())
+        else {
+            continue;
+        };
+
+        let resolved = if let Some(index) = returned_id.strip_prefix("$expected:") {
+            index
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| expected_order_ids.get(index))
+                .cloned()
+        } else if let Some(literal) = returned_id.strip_prefix("$literal:") {
+            Some(literal.to_string())
+        } else {
+            expected_order_ids.get(response_index).cloned()
+        };
+
+        if let Some(resolved) = resolved {
+            response["orderID"] = Value::String(resolved);
+        }
+    }
 }
 
 async fn handle_delete_order(State(state): State<TestServerState>, body: Bytes) -> Response {
@@ -3963,8 +4006,8 @@ async fn test_submit_order_list_serializes_amount_matrix(
 ) {
     let state = TestServerState::default();
     *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xbatch-order-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xbatch-order-2", "errorMsg": ""}
+        {"success": true, "orderID": "$expected:1", "errorMsg": ""},
+        {"success": true, "orderID": "$expected:0", "errorMsg": ""}
     ]));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, _rx, cache) = create_test_execution_client(addr);
@@ -4105,8 +4148,8 @@ async fn test_submit_order_list_denies_unrepresentable_immediate_buys_before_pos
 async fn test_submit_order_list_posts_batch_and_accepts_orders(#[case] prepare_all_or_none: bool) {
     let state = TestServerState::default();
     *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xbatch-order-1", "errorMsg": ""},
-        {"success": true, "orderID": "0xbatch-order-2", "errorMsg": ""}
+        {"success": true, "orderID": "$expected:1", "errorMsg": ""},
+        {"success": true, "orderID": "$expected:0", "errorMsg": ""}
     ]));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -4552,12 +4595,26 @@ async fn test_submit_order_list_rejects_failed_batch_response_entry() {
 }
 
 #[rstest]
+#[case::short("short")]
+#[case::unknown_id("unknown")]
+#[case::duplicate_id("duplicate")]
 #[tokio::test]
-async fn test_submit_order_list_leaves_missing_batch_responses_submitted() {
+async fn test_submit_order_list_leaves_uncorrelated_batch_leg_pending(#[case] kind: &str) {
     let state = TestServerState::default();
-    *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": "0xbatch-order-1", "errorMsg": ""}
-    ]));
+    *state.batch_order_response.lock().await = Some(match kind {
+        "short" => json!([
+            {"success": true, "orderID": "$expected:0", "errorMsg": ""}
+        ]),
+        "unknown" => json!([
+            {"success": true, "orderID": "$expected:0", "errorMsg": ""},
+            {"success": true, "orderID": "$literal:0xunknown-order", "errorMsg": ""}
+        ]),
+        "duplicate" => json!([
+            {"success": true, "orderID": "$expected:0", "errorMsg": ""},
+            {"success": true, "orderID": "$expected:0", "errorMsg": ""}
+        ]),
+        other => panic!("unknown case {other}"),
+    });
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
     client.start().unwrap();
@@ -5978,19 +6035,10 @@ async fn test_group_cancel_around_batch_submit_ack_is_not_lost(
     #[case] cancel_before_ack: bool,
 ) {
     let state = TestServerState::default();
-    let venue_order_ids = ["0xvenue-group-deferred-1", "0xvenue-group-deferred-2"];
     *state.batch_order_response.lock().await = Some(json!([
-        {"success": true, "orderID": venue_order_ids[0], "errorMsg": null},
-        {"success": true, "orderID": venue_order_ids[1], "errorMsg": null}
+        {"success": true, "orderID": "$expected:0", "errorMsg": null},
+        {"success": true, "orderID": "$expected:1", "errorMsg": null}
     ]));
-    *state.cancel_response.lock().await = Some(json!({
-        "canceled": venue_order_ids,
-        "not_canceled": {}
-    }));
-    *state.batch_cancel_response.lock().await = Some(json!({
-        "canceled": venue_order_ids,
-        "not_canceled": {}
-    }));
     state.batch_order_request_gate.enable();
 
     let addr = start_mock_server(state.clone()).await;
@@ -6034,6 +6082,23 @@ async fn test_group_cancel_around_batch_submit_ack_is_not_lost(
         Duration::from_secs(1),
     )
     .await;
+
+    let expected_order_ids = expected_batch_order_ids(
+        state
+            .last_body
+            .lock()
+            .await
+            .as_ref()
+            .expect("batch request body"),
+    );
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": expected_order_ids,
+        "not_canceled": {}
+    }));
+    *state.batch_cancel_response.lock().await = Some(json!({
+        "canceled": expected_order_ids,
+        "not_canceled": {}
+    }));
 
     for order in &mut orders {
         submit_and_pending_cancel(&cache, order);
@@ -6272,23 +6337,18 @@ async fn test_batch_submit_cancel_shutdown_cancels_orders_accepted_during_shutdo
     #[case] action: ShutdownAction,
 ) {
     let state = TestServerState::default();
-    let venue_order_ids = ["0xvenue-batch-stop-1", "0xvenue-batch-stop-2"];
     *state.batch_order_response.lock().await = Some(json!([
         {
             "success": true,
-            "orderID": venue_order_ids[0],
+            "orderID": "$expected:0",
             "errorMsg": null
         },
         {
             "success": true,
-            "orderID": venue_order_ids[1],
+            "orderID": "$expected:1",
             "errorMsg": null
         }
     ]));
-    *state.cancel_response.lock().await = Some(json!({
-        "canceled": venue_order_ids,
-        "not_canceled": {}
-    }));
     state.batch_order_request_gate.enable();
 
     let addr = start_mock_server(state.clone()).await;
@@ -6345,6 +6405,19 @@ async fn test_batch_submit_cancel_shutdown_cancels_orders_accepted_during_shutdo
         Duration::from_secs(1),
     )
     .await;
+
+    let expected_order_ids = expected_batch_order_ids(
+        state
+            .last_body
+            .lock()
+            .await
+            .as_ref()
+            .expect("batch request body"),
+    );
+    *state.cancel_response.lock().await = Some(json!({
+        "canceled": expected_order_ids,
+        "not_canceled": {}
+    }));
 
     match action {
         ShutdownAction::Stop => {
