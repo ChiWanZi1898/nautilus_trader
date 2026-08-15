@@ -80,8 +80,7 @@ use nautilus_polymarket::{
     common::{
         consts::{
             POLYMARKET_CLIENT_ID, POLYMARKET_NAUTILUS_BUILDER_CODE,
-            POLYMARKET_PREPARE_ALL_OR_NONE_PARAM, POLYMARKET_VENUE,
-            POLYMARKET_ZERO_BUILDER_CODE,
+            POLYMARKET_PREPARE_ALL_OR_NONE_PARAM, POLYMARKET_VENUE, POLYMARKET_ZERO_BUILDER_CODE,
         },
         enums::{PolymarketBuilderAttribution, SignatureType},
     },
@@ -4228,6 +4227,7 @@ async fn test_none_builder_attribution_signs_single_order_with_zero_builder() {
     let addr = start_mock_server(state.clone()).await;
     let mut config = create_test_exec_config(addr);
     config.builder_attribution = PolymarketBuilderAttribution::None;
+    config.pre_activate_expected_order_ids = true;
     let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
     client.start().unwrap();
 
@@ -4277,6 +4277,7 @@ async fn test_none_builder_attribution_drives_prepare_all_batch_correlation() {
     let addr = start_mock_server(state.clone()).await;
     let mut config = create_test_exec_config(addr);
     config.builder_attribution = PolymarketBuilderAttribution::None;
+    config.pre_activate_expected_order_ids = true;
     let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
     client.start().unwrap();
 

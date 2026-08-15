@@ -105,6 +105,66 @@ impl OrderFillTrackerMap {
             .insert(venue_order_id, state);
     }
 
+    /// Idempotently activates fill tracking for an expected signed venue order ID.
+    ///
+    /// Returns `Ok(true)` when this call inserts the state and `Ok(false)` when compatible state
+    /// already exists. Buffered activity or incompatible quantity/side fails closed, because it
+    /// may belong to an earlier submission with the same identity.
+    pub(crate) fn activate_expected_order(
+        &self,
+        venue_order_id: VenueOrderId,
+        submitted_qty: Quantity,
+        order_side: OrderSide,
+    ) -> Result<bool, String> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if guard.pending_fills.contains_key(&venue_order_id)
+            || guard.pending_reports.contains_key(&venue_order_id)
+        {
+            return Err(format!(
+                "expected signed venue order ID {venue_order_id} has buffered activity before HTTP handoff"
+            ));
+        }
+
+        if let Some(existing) = guard.orders.get(&venue_order_id) {
+            return if existing.submitted_qty == submitted_qty && existing.order_side == order_side {
+                Ok(false)
+            } else {
+                Err(format!(
+                    "expected signed venue order ID {venue_order_id} has incompatible fill state"
+                ))
+            };
+        }
+
+        guard
+            .orders
+            .insert(venue_order_id, new_order_state(submitted_qty, order_side));
+        Ok(true)
+    }
+
+    /// Removes pristine fill state inserted for a submission proven not to have reached handoff.
+    pub(crate) fn deactivate_pristine_order(
+        &self,
+        venue_order_id: VenueOrderId,
+        submitted_qty: Quantity,
+        order_side: OrderSide,
+    ) -> bool {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let Some(existing) = guard.orders.get(&venue_order_id) else {
+            return false;
+        };
+        if existing.submitted_qty != submitted_qty
+            || existing.order_side != order_side
+            || !existing.cumulative_filled.is_zero()
+            || guard.pending_fills.contains_key(&venue_order_id)
+            || guard.pending_reports.contains_key(&venue_order_id)
+        {
+            return false;
+        }
+
+        guard.orders.remove(&venue_order_id);
+        true
+    }
+
     /// Returns true if the order has been registered (accepted).
     pub(crate) fn contains(&self, venue_order_id: &VenueOrderId) -> bool {
         self.inner
@@ -209,9 +269,12 @@ impl OrderFillTrackerMap {
         order_side: OrderSide,
     ) -> Vec<BufferedFill> {
         let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        guard
-            .orders
-            .insert(venue_order_id, new_order_state(submitted_qty, order_side));
+        register_order_state_if_absent(
+            &mut guard.orders,
+            venue_order_id,
+            submitted_qty,
+            order_side,
+        );
         take_and_prepare_fills(&mut guard, venue_order_id, client_order_id)
     }
 
@@ -230,9 +293,12 @@ impl OrderFillTrackerMap {
         if !guard.pending_fills.contains_key(&venue_order_id) {
             return None;
         }
-        guard
-            .orders
-            .insert(venue_order_id, new_order_state(submitted_qty, order_side));
+        register_order_state_if_absent(
+            &mut guard.orders,
+            venue_order_id,
+            submitted_qty,
+            order_side,
+        );
         Some(take_and_prepare_fills(
             &mut guard,
             venue_order_id,
@@ -472,6 +538,23 @@ fn new_order_state(submitted_qty: Quantity, order_side: OrderSide) -> OrderFillS
         cumulative_filled: Quantity::zero(submitted_qty.precision),
         order_side,
     }
+}
+
+fn register_order_state_if_absent(
+    orders: &mut FifoCacheMap<VenueOrderId, OrderFillState, 10_000>,
+    venue_order_id: VenueOrderId,
+    submitted_qty: Quantity,
+    order_side: OrderSide,
+) {
+    if let Some(existing) = orders.get(&venue_order_id) {
+        if existing.submitted_qty != submitted_qty || existing.order_side != order_side {
+            log::error!(
+                "Refusing to replace incompatible fill state for venue order {venue_order_id}"
+            );
+        }
+        return;
+    }
+    orders.insert(venue_order_id, new_order_state(submitted_qty, order_side));
 }
 
 fn buy_overfill_bump_in(

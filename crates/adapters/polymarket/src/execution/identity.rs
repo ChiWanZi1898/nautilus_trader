@@ -37,7 +37,7 @@ use nautilus_model::{
 /// `trader_id` and `account_id` are client-wide constants threaded from the dispatch context,
 /// so they are not stored here. Fill-specific values (`last_qty`, `last_px`, `trade_id`,
 /// `commission`) come from the venue trade payload.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OrderIdentity {
     pub client_order_id: ClientOrderId,
     pub strategy_id: StrategyId,
@@ -88,17 +88,76 @@ struct RegistryInner {
 }
 
 impl OrderIdentityRegistry {
+    /// Idempotently activates an expected signed venue identity.
+    ///
+    /// Returns `Ok(true)` when this call inserted the identity and `Ok(false)` when the exact
+    /// identity was already active. A hash or client-ID collision fails closed.
+    pub(crate) fn activate_expected_identity(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> Result<bool, String> {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        let existing_identity = guard.identities.get(&venue_order_id).copied();
+        let existing_venue = guard
+            .client_to_venue
+            .get(&identity.client_order_id)
+            .copied();
+
+        match (existing_identity, existing_venue) {
+            (Some(existing), Some(existing_id))
+                if existing == identity && existing_id == venue_order_id =>
+            {
+                Ok(false)
+            }
+            (None, None) => {
+                guard.identities.insert(venue_order_id, identity);
+                guard
+                    .client_to_venue
+                    .insert(identity.client_order_id, venue_order_id);
+                Ok(true)
+            }
+            _ => Err(format!(
+                "expected signed order identity collision for client {} and venue {}",
+                identity.client_order_id, venue_order_id
+            )),
+        }
+    }
+
+    /// Removes an identity inserted for a submission proven not to have reached HTTP handoff.
+    ///
+    /// An identity which has already emitted acceptance is retained.
+    pub(crate) fn deactivate_unaccepted_identity(
+        &self,
+        venue_order_id: VenueOrderId,
+        identity: OrderIdentity,
+    ) -> bool {
+        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
+        if guard.accepted.contains(&venue_order_id)
+            || guard.identities.get(&venue_order_id).copied() != Some(identity)
+            || guard
+                .client_to_venue
+                .get(&identity.client_order_id)
+                .copied()
+                != Some(venue_order_id)
+        {
+            return false;
+        }
+
+        guard.identities.remove(&venue_order_id);
+        guard.client_to_venue.remove(&identity.client_order_id);
+        true
+    }
+
     /// Records the identity for a tracked order under its venue order ID.
     pub(crate) fn register_order_identity(
         &self,
         venue_order_id: VenueOrderId,
         identity: OrderIdentity,
     ) {
-        let mut guard = self.inner.lock().expect(MUTEX_POISONED);
-        guard.identities.insert(venue_order_id, identity);
-        guard
-            .client_to_venue
-            .insert(identity.client_order_id, venue_order_id);
+        if let Err(reason) = self.activate_expected_identity(venue_order_id, identity) {
+            log::error!("Failed to register Polymarket order identity: {reason}");
+        }
     }
 
     /// Returns the identity for a tracked order, if known.

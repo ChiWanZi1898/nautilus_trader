@@ -30,11 +30,44 @@ pub(crate) struct PendingSubmitTracker {
 }
 
 impl PendingSubmitTracker {
+    /// Idempotently maps an expected signed venue order ID to its local client order ID.
+    pub(crate) fn activate(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+    ) -> Result<bool, String> {
+        let mut guard = self.venue_to_client.lock().expect(MUTEX_POISONED);
+        match guard.get(&venue_order_id).copied() {
+            Some(existing) if existing == client_order_id => Ok(false),
+            Some(existing) => Err(format!(
+                "expected signed venue order ID {venue_order_id} already maps to client {existing}"
+            )),
+            None => {
+                guard.insert(venue_order_id, client_order_id);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Removes a mapping inserted for a submission proven not to have reached HTTP handoff.
+    pub(crate) fn deactivate(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+    ) -> bool {
+        let mut guard = self.venue_to_client.lock().expect(MUTEX_POISONED);
+        if guard.get(&venue_order_id).copied() != Some(client_order_id) {
+            return false;
+        }
+        guard.remove(&venue_order_id);
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert(&self, venue_order_id: VenueOrderId, client_order_id: ClientOrderId) {
-        self.venue_to_client
-            .lock()
-            .expect(MUTEX_POISONED)
-            .insert(venue_order_id, client_order_id);
+        if let Err(reason) = self.activate(venue_order_id, client_order_id) {
+            log::error!("Failed to register pending Polymarket submit: {reason}");
+        }
     }
 
     pub(crate) fn client_order_id(&self, venue_order_id: &VenueOrderId) -> Option<ClientOrderId> {

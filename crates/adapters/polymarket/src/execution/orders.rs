@@ -28,6 +28,7 @@ use rust_decimal::Decimal;
 
 use super::{
     PolymarketExecutionClient,
+    activation::{ExpectedSubmitActivation, activate_expected_submit},
     cancellations::execute_deferred_cancel,
     order_builder::PolymarketOrderBuilder,
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
@@ -111,6 +112,7 @@ impl PolymarketExecutionClient {
         let account_id = self.core.account_id;
         let size_precision = instrument.size_precision();
         let price_precision = instrument.price_precision();
+        let pre_activate_expected_order_ids = self.config.pre_activate_expected_order_ids;
 
         self.spawn_task("submit_limit_order", async move {
             let submission = match submitter.prepare_limit_order_submission(&request).await {
@@ -122,6 +124,32 @@ impl PolymarketExecutionClient {
             };
 
             let expected_venue_order_id = submission.expected_venue_order_id;
+            let mut activation = if pre_activate_expected_order_ids {
+                match activate_expected_submit(
+                    &order,
+                    expected_venue_order_id,
+                    &fill_tracker,
+                    &order_identities,
+                    &pending_submits,
+                ) {
+                    Ok(activation) => Some(activation),
+                    Err(reason) => {
+                        reject_submit_order(
+                            &order,
+                            &format!("Expected signed identity activation failed: {reason}"),
+                            &emitter,
+                            clock,
+                            &pending_cancels,
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(activation) = &mut activation {
+                activation.mark_http_handoff_started();
+            }
             match submitter.post_limit_order_submission(submission).await {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
@@ -622,6 +650,8 @@ impl PolymarketExecutionClient {
         let pending_cancels = self.pending_cancels.clone();
         let pending_tasks = self.pending_tasks.clone();
         let account_id = self.core.account_id;
+        let pre_activate_expected_order_ids =
+            self.config.pre_activate_expected_order_ids && prepare_all_or_none;
 
         self.spawn_task("submit_order_list", async move {
             if !prepare_all_or_none {
@@ -670,14 +700,37 @@ impl PolymarketExecutionClient {
                 }
             }
 
+            if submissions.is_empty() {
+                return Ok(());
+            }
+
+            let mut activations: Vec<ExpectedSubmitActivation> =
+                Vec::with_capacity(submissions.len());
+            if pre_activate_expected_order_ids {
+                for (batch_order, submission) in prepared_orders.iter().zip(&submissions) {
+                    match activate_expected_submit(
+                        &batch_order.order,
+                        submission.expected_venue_order_id,
+                        &fill_tracker,
+                        &order_identities,
+                        &pending_submits,
+                    ) {
+                        Ok(activation) => activations.push(activation),
+                        Err(reason) => {
+                            let reason = format!(
+                                "Prepare-all-or-none expected signed identity activation failed; no orders were submitted: {reason}"
+                            );
+                            deny_prepare_all_or_none_batch(&emitter, &plan_orders, &reason);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             if prepare_all_or_none {
                 for batch_order in &prepared_orders {
                     emitter.emit_order_submitted(&batch_order.order);
                 }
-            }
-
-            if submissions.is_empty() {
-                return Ok(());
             }
 
             let total = submissions.len();
@@ -686,6 +739,11 @@ impl PolymarketExecutionClient {
                 let end = (offset + BATCH_ORDER_LIMIT).min(total);
                 let mut submissions_chunk = submissions[offset..end].to_vec();
                 let mut orders_chunk = prepared_orders[offset..end].to_vec();
+                if pre_activate_expected_order_ids {
+                    for activation in &mut activations[offset..end] {
+                        activation.mark_http_handoff_started();
+                    }
+                }
 
                 if submissions_chunk.len() == 1 {
                     let submission = submissions_chunk.pop().expect("len 1");

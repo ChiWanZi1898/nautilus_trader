@@ -25,6 +25,7 @@ pub(crate) mod reconciliation;
 pub(crate) mod submitter;
 pub(crate) mod types;
 
+mod activation;
 mod cancellations;
 mod lifecycle;
 mod orders;

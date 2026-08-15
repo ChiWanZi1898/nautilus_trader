@@ -523,6 +523,12 @@ pub struct PolymarketExecClientConfig {
     /// Builder attribution embedded in every signed order.
     #[builder(default)]
     pub builder_attribution: PolymarketBuilderAttribution,
+    /// Activates the expected signed venue order ID immediately before the HTTP submit handoff.
+    ///
+    /// This lets authenticated user-stream activity identify and advance an in-flight order before
+    /// its HTTP response arrives. The activation is process-local and is not crash-durable.
+    #[builder(default)]
+    pub pre_activate_expected_order_ids: bool,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub base_url_data_api: Option<String>,
@@ -551,6 +557,7 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
     funder: Option<String>,
     signature_type: SignatureType,
     builder_attribution: PolymarketBuilderAttribution,
+    pre_activate_expected_order_ids: bool,
     base_url_http: Option<String>,
     base_url_ws: Option<String>,
     base_url_data_api: Option<String>,
@@ -574,6 +581,10 @@ impl Debug for PolymarketExecClientConfig {
             .field("funder", &self.funder)
             .field("signature_type", &self.signature_type)
             .field("builder_attribution", &self.builder_attribution)
+            .field(
+                "pre_activate_expected_order_ids",
+                &self.pre_activate_expected_order_ids,
+            )
             .field("base_url_http", &self.base_url_http)
             .field("base_url_ws", &self.base_url_ws)
             .field("base_url_data_api", &self.base_url_data_api)
@@ -778,6 +789,7 @@ log_warnings = false
         );
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.max_retries, expected.max_retries);
+        assert!(!config.pre_activate_expected_order_ids);
         assert!(!config.heartbeat_enabled);
         assert_eq!(config.transport_backend, expected.transport_backend);
     }
@@ -791,6 +803,14 @@ log_warnings = false
             config.builder_attribution,
             PolymarketBuilderAttribution::None
         );
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_accepts_expected_order_pre_activation() {
+        let config: PolymarketExecClientConfig =
+            toml::from_str("pre_activate_expected_order_ids = true").unwrap();
+
+        assert!(config.pre_activate_expected_order_ids);
     }
 
     #[rstest]
