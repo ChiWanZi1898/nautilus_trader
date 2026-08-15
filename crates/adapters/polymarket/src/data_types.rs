@@ -15,12 +15,131 @@
 
 //! Polymarket-specific custom data types.
 //!
-//! These types carry Polymarket RTDS domain data through the Nautilus data engine as
+//! These types carry Polymarket domain data through the Nautilus data engine as
 //! [`CustomData`](nautilus_model::data::CustomData).
 
+use std::sync::Arc;
+
 use nautilus_core::UnixNanos;
-use nautilus_model::types::Price;
+use nautilus_model::{
+    data::{HasTsInit, custom::CustomDataTrait},
+    identifiers::InstrumentId,
+    types::Price,
+};
 use nautilus_persistence_macros::custom_data;
+use serde::{Deserialize, Serialize};
+
+/// Type name published for [`PolymarketFrameCommit`] custom data.
+pub const POLYMARKET_FRAME_COMMIT_TYPE_NAME: &str = "PolymarketFrameCommit";
+
+/// Immutable evidence that one Polymarket market-data WebSocket frame was fully accepted.
+///
+/// The adapter publishes this after every L2 delta batch derived from the frame has entered the
+/// same data-event FIFO. A strategy can mark instruments dirty on delta callbacks and use this
+/// value as the frame evaluation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketFrameCommit {
+    frame_id: u64,
+    affected_instrument_ids: Vec<InstrumentId>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl PolymarketFrameCommit {
+    pub(crate) fn new(
+        frame_id: u64,
+        affected_instrument_ids: Vec<InstrumentId>,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> Self {
+        debug_assert!(frame_id > 0);
+        debug_assert!(!affected_instrument_ids.is_empty());
+        debug_assert!(affected_instrument_ids.is_sorted());
+        debug_assert!(
+            affected_instrument_ids
+                .windows(2)
+                .all(|ids| ids[0] != ids[1])
+        );
+        Self {
+            frame_id,
+            affected_instrument_ids,
+            ts_event,
+            ts_init,
+        }
+    }
+
+    /// Returns the monotonic adapter-local frame identifier.
+    #[must_use]
+    pub const fn frame_id(&self) -> u64 {
+        self.frame_id
+    }
+
+    /// Returns the canonical sorted instrument IDs affected by this frame.
+    #[must_use]
+    pub fn affected_instrument_ids(&self) -> &[InstrumentId] {
+        &self.affected_instrument_ids
+    }
+
+    /// Returns the venue event timestamp for the committed frame.
+    #[must_use]
+    pub const fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+}
+
+impl HasTsInit for PolymarketFrameCommit {
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+}
+
+impl CustomDataTrait for PolymarketFrameCommit {
+    fn type_name(&self) -> &'static str {
+        POLYMARKET_FRAME_COMMIT_TYPE_NAME
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+        Arc::new(self.clone())
+    }
+
+    fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn type_name_static() -> &'static str {
+        POLYMARKET_FRAME_COMMIT_TYPE_NAME
+    }
+
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Arc<dyn CustomDataTrait>> {
+        let commit = serde_json::from_value::<Self>(value)?;
+        anyhow::ensure!(commit.frame_id > 0, "frame_id must be non-zero");
+        anyhow::ensure!(
+            !commit.affected_instrument_ids.is_empty(),
+            "affected_instrument_ids must not be empty",
+        );
+        anyhow::ensure!(
+            commit.affected_instrument_ids.is_sorted()
+                && commit
+                    .affected_instrument_ids
+                    .windows(2)
+                    .all(|ids| ids[0] != ids[1]),
+            "affected_instrument_ids must be sorted and unique",
+        );
+        Ok(Arc::new(commit))
+    }
+}
 
 /// Polymarket RTDS crypto price sample from the `crypto_prices` topic.
 ///
@@ -76,6 +195,7 @@ pub struct PolymarketRtdsEquityPrice {
 ///
 /// Safe to call multiple times (idempotent via internal `Once` guards).
 pub fn register_polymarket_custom_data() {
+    let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketFrameCommit>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsCryptoPrice>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsEquityPrice>();
 }

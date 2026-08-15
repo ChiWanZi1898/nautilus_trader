@@ -75,6 +75,7 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
     let ctx = WsMessageContext {
         clock: client.clock,
         data_sender: client.data_sender.clone(),
+        frame_counter: client.frame_counter.clone(),
         token_meta: client.token_meta.clone(),
         instruments: client.instruments.clone(),
         gamma_client: client.provider.http_client().clone(),

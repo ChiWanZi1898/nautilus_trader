@@ -26,7 +26,7 @@ mod subscriptions;
 use std::{
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -117,6 +117,7 @@ pub struct PolymarketDataClient {
     cancellation_token: CancellationToken,
     tasks: Vec<JoinHandle<()>>,
     data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    frame_counter: Arc<AtomicU64>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     order_books: Arc<DashMap<InstrumentId, OrderBook>>,
@@ -204,6 +205,7 @@ impl PolymarketDataClient {
             cancellation_token: CancellationToken::new(),
             tasks: Vec::new(),
             data_sender,
+            frame_counter: Arc::new(AtomicU64::new(0)),
             instruments: Arc::new(AtomicMap::new()),
             token_meta: Arc::new(DashMap::new()),
             order_books: Arc::new(DashMap::new()),

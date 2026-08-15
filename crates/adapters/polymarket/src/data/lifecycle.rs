@@ -76,6 +76,7 @@ impl PolymarketDataClient {
         let ctx = WsMessageContext {
             clock: self.clock,
             data_sender: self.data_sender.clone(),
+            frame_counter: self.frame_counter.clone(),
             token_meta: self.token_meta.clone(),
             instruments: self.instruments.clone(),
             gamma_client: self.provider.http_client().clone(),
@@ -150,6 +151,7 @@ impl PolymarketDataClient {
         let ctx = WsMessageContext {
             clock: self.clock,
             data_sender: self.data_sender.clone(),
+            frame_counter: self.frame_counter.clone(),
             token_meta: self.token_meta.clone(),
             instruments: self.instruments.clone(),
             gamma_client: gamma_client.clone(),

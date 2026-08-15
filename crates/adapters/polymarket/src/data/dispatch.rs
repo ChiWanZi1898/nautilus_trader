@@ -24,14 +24,18 @@
 //! unchanged side's size carries forward. See
 //! `docs/integrations/polymarket.md` for the full description.
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use dashmap::DashMap;
 use nautilus_common::{live::get_runtime, messages::DataEvent};
 use nautilus_core::{AtomicMap, AtomicSet, time::AtomicTime};
 use nautilus_model::{
     data::{
-        Data as NautilusData, InstrumentStatus, OrderBookDeltas, OrderBookDeltas_API, QuoteTick,
+        CustomData as NautilusCustomData, Data as NautilusData, InstrumentStatus, OrderBookDeltas,
+        OrderBookDeltas_API, QuoteTick,
     },
     enums::{BookType, MarketStatusAction, RecordFlag},
     identifiers::InstrumentId,
@@ -46,6 +50,7 @@ use super::{
     instruments::{TokenMeta, cache_instrument_if_active},
 };
 use crate::{
+    data_types::PolymarketFrameCommit,
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, gamma::PolymarketGammaHttpClient,
@@ -82,6 +87,7 @@ impl Drop for NewMarketInflightGuard {
 pub(super) struct WsMessageContext {
     pub(super) clock: &'static AtomicTime,
     pub(super) data_sender: tokio::sync::mpsc::UnboundedSender<DataEvent>,
+    pub(super) frame_counter: Arc<AtomicU64>,
     pub(super) token_meta: Arc<DashMap<Ustr, TokenMeta>>,
     pub(super) instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     pub(super) gamma_client: PolymarketGammaHttpClient,
@@ -113,6 +119,59 @@ impl WsMessageContext {
             apply_mutex: self.resolve_watch_apply_mutex.clone(),
         }
     }
+}
+
+fn emit_l2_frame(
+    ctx: &WsMessageContext,
+    batches: Vec<OrderBookDeltas>,
+    staged_books: Vec<(InstrumentId, OrderBook)>,
+    ts_event: nautilus_core::UnixNanos,
+    ts_init: nautilus_core::UnixNanos,
+) -> bool {
+    if batches.is_empty() {
+        return true;
+    }
+
+    let mut affected_instrument_ids = batches
+        .iter()
+        .map(|deltas| deltas.instrument_id)
+        .collect::<Vec<_>>();
+    affected_instrument_ids.sort_unstable();
+    affected_instrument_ids.dedup();
+
+    for deltas in batches {
+        let data: NautilusData = OrderBookDeltas_API::new(deltas).into();
+        if let Err(e) = ctx.data_sender.send(DataEvent::Data(data)) {
+            log::error!("Failed to emit book deltas: {e}");
+            return false;
+        }
+    }
+
+    for (instrument_id, book) in staged_books {
+        ctx.order_books.insert(instrument_id, book);
+    }
+
+    let Ok(previous_frame_id) =
+        ctx.frame_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+    else {
+        log::error!("Polymarket market-data frame counter exhausted");
+        return false;
+    };
+    let frame_id = previous_frame_id + 1;
+
+    let commit = PolymarketFrameCommit::new(frame_id, affected_instrument_ids, ts_event, ts_init);
+    let custom = NautilusCustomData::from_arc(Arc::new(commit));
+    if let Err(e) = ctx
+        .data_sender
+        .send(DataEvent::Data(NautilusData::Custom(custom)))
+    {
+        log::error!("Failed to emit Polymarket frame commit: {e}");
+        return false;
+    }
+    true
 }
 
 fn new_market_dedupe_key(nm: &PolymarketNewMarket) -> String {
@@ -180,7 +239,10 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
             };
             let instrument_id = meta.instrument_id;
             let ts_init = ctx.clock.get_time_ns();
-            let mut book_seeded = false;
+            let mut frame_valid = true;
+            let mut delta_batches = Vec::new();
+            let mut staged_books = Vec::new();
+            let mut ts_event = None;
 
             if ctx.active_delta_subs.contains(&instrument_id) {
                 match parse_book_snapshot(
@@ -191,55 +253,80 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                     ts_init,
                 ) {
                     Ok(deltas) => {
-                        let mut book = ctx
-                            .order_books
-                            .entry(instrument_id)
-                            .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
+                        ts_event = Some(deltas.ts_event);
+                        let mut book = ctx.order_books.get(&instrument_id).map_or_else(
+                            || OrderBook::new(instrument_id, BookType::L2_MBP),
+                            |existing| existing.clone(),
+                        );
 
                         match book.apply_deltas(&deltas) {
-                            Ok(()) => book_seeded = true,
+                            Ok(()) => staged_books.push((instrument_id, book)),
                             Err(e) => {
+                                frame_valid = false;
                                 log::error!(
                                     "Failed to apply book snapshot for {instrument_id}: {e}"
                                 );
                             }
                         }
 
-                        let data: NautilusData = OrderBookDeltas_API::new(deltas).into();
-                        if let Err(e) = ctx.data_sender.send(DataEvent::Data(data)) {
-                            log::error!("Failed to emit book deltas: {e}");
-                        }
+                        delta_batches.push(deltas);
                     }
-                    Err(e) => log::error!("Failed to parse book snapshot: {e}"),
+                    Err(e) => {
+                        frame_valid = false;
+                        log::error!("Failed to parse book snapshot: {e}");
+                    }
                 }
             }
 
-            if ctx.active_quote_subs.contains(&instrument_id) {
+            let staged_quote = if ctx.active_quote_subs.contains(&instrument_id) {
                 let price_increment = {
                     let instruments = ctx.instruments.load();
-                    let Some(instrument) = instruments.get(&instrument_id) else {
-                        log::error!("No instrument for {instrument_id}");
-                        return;
-                    };
-                    instrument.price_increment()
+                    instruments
+                        .get(&instrument_id)
+                        .map(Instrument::price_increment)
                 };
 
-                match parse_quote_from_snapshot(
-                    &snap,
-                    instrument_id,
-                    meta.price_precision,
-                    meta.size_precision,
-                    price_increment,
-                    ctx.drop_quotes_missing_side,
-                    ts_init,
-                ) {
-                    Ok(Some(quote)) => emit_quote_if_changed(ctx, instrument_id, quote),
-                    Ok(None) => {}
-                    Err(e) => log::error!("Failed to parse quote from snapshot: {e}"),
+                match price_increment {
+                    Some(price_increment) => match parse_quote_from_snapshot(
+                        &snap,
+                        instrument_id,
+                        meta.price_precision,
+                        meta.size_precision,
+                        price_increment,
+                        ctx.drop_quotes_missing_side,
+                        ts_init,
+                    ) {
+                        Ok(quote) => quote,
+                        Err(e) => {
+                            frame_valid = false;
+                            log::error!("Failed to parse quote from snapshot: {e}");
+                            None
+                        }
+                    },
+                    None => {
+                        frame_valid = false;
+                        log::error!("No instrument for {instrument_id}");
+                        None
+                    }
                 }
+            } else {
+                None
+            };
+
+            let frame_emitted = if frame_valid {
+                ts_event.is_none_or(|ts_event| {
+                    emit_l2_frame(ctx, delta_batches, staged_books, ts_event, ts_init)
+                })
+            } else {
+                false
+            };
+
+            if let Some(quote) = staged_quote {
+                emit_quote_if_changed(ctx, instrument_id, quote);
             }
 
-            if book_seeded
+            if frame_emitted
+                && ts_event.is_some()
                 && ctx
                     .pending_snapshot_after_tick_change
                     .contains(&instrument_id)
@@ -260,6 +347,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                 }
             };
 
+            let mut frame_valid = true;
             let mut resolved = Vec::with_capacity(quotes.price_changes.len());
             let mut groups: Vec<(TokenMeta, Vec<_>)> = Vec::new();
 
@@ -268,6 +356,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                 let meta = match ctx.token_meta.get(&token_id) {
                     Some(m) => *m,
                     None => {
+                        frame_valid = false;
                         log::debug!("No instrument for token_id {token_id}");
                         continue;
                     }
@@ -283,80 +372,93 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                 }
             }
 
-            for (meta, change) in resolved {
+            let mut delta_batches = Vec::new();
+            let mut staged_books = Vec::new();
+
+            for (meta, changes) in &groups {
                 let instrument_id = meta.instrument_id;
-                let group = groups
-                    .iter_mut()
-                    .find(|(existing, _)| existing.instrument_id == instrument_id)
-                    .map(|(_, changes)| std::mem::take(changes));
+                let active = ctx.active_delta_subs.contains(&instrument_id);
+                let pending = ctx
+                    .pending_snapshot_after_tick_change
+                    .contains(&instrument_id);
 
-                if let Some(changes) = group.filter(|changes| !changes.is_empty())
-                    && ctx.active_delta_subs.contains(&instrument_id)
-                {
-                    if ctx
-                        .pending_snapshot_after_tick_change
-                        .contains(&instrument_id)
-                    {
-                        log::debug!(
-                            "Dropping book deltas for {instrument_id}: awaiting snapshot after tick size change",
-                        );
-                    } else {
-                        let mut parsed = Vec::with_capacity(changes.len());
+                if active && pending {
+                    frame_valid = false;
+                    log::debug!(
+                        "Dropping book deltas for {instrument_id}: awaiting snapshot after tick size change",
+                    );
+                }
 
-                        for change in changes {
-                            let per_asset = PolymarketQuotes {
-                                market: quotes.market,
-                                price_changes: vec![change],
-                                timestamp: quotes.timestamp.clone(),
-                            };
+                let mut parsed = Vec::with_capacity(changes.len());
+                for change in changes {
+                    let per_asset = PolymarketQuotes {
+                        market: quotes.market,
+                        price_changes: vec![change.clone()],
+                        timestamp: quotes.timestamp.clone(),
+                    };
 
-                            match parse_book_deltas(
-                                &per_asset,
-                                instrument_id,
-                                meta.price_precision,
-                                meta.size_precision,
-                                ts_init,
-                            ) {
-                                Ok(mut deltas) => parsed.append(&mut deltas.deltas),
-                                Err(e) => log::error!(
-                                    "Failed to parse book delta for {instrument_id}: {e}"
-                                ),
-                            }
-                        }
-
-                        if !parsed.is_empty() {
-                            for delta in &mut parsed {
-                                delta.flags &= !(RecordFlag::F_LAST as u8);
-                            }
-                            parsed.last_mut().expect("parsed not empty").flags |=
-                                RecordFlag::F_LAST as u8;
-
-                            let deltas = OrderBookDeltas::new(instrument_id, parsed);
-                            if let Some(mut book) = ctx.order_books.get_mut(&instrument_id)
-                                && let Err(e) = book.apply_deltas(&deltas)
-                            {
-                                log::error!("Failed to apply book deltas for {instrument_id}: {e}");
-                            }
-
-                            let data: NautilusData = OrderBookDeltas_API::new(deltas).into();
-                            if let Err(e) = ctx.data_sender.send(DataEvent::Data(data)) {
-                                log::error!("Failed to emit book deltas: {e}");
-                            }
+                    match parse_book_deltas(
+                        &per_asset,
+                        instrument_id,
+                        meta.price_precision,
+                        meta.size_precision,
+                        ts_init,
+                    ) {
+                        Ok(mut deltas) => parsed.append(&mut deltas.deltas),
+                        Err(e) => {
+                            frame_valid = false;
+                            log::error!("Failed to parse book delta for {instrument_id}: {e}");
                         }
                     }
                 }
 
+                if active && !pending && !parsed.is_empty() {
+                    for delta in &mut parsed {
+                        delta.flags &= !(RecordFlag::F_LAST as u8);
+                    }
+                    parsed.last_mut().expect("parsed not empty").flags |= RecordFlag::F_LAST as u8;
+
+                    let deltas = OrderBookDeltas::new(instrument_id, parsed);
+                    if let Some(mut book) = ctx
+                        .order_books
+                        .get(&instrument_id)
+                        .map(|existing| existing.clone())
+                    {
+                        match book.apply_deltas(&deltas) {
+                            Ok(()) => staged_books.push((instrument_id, book)),
+                            Err(e) => {
+                                frame_valid = false;
+                                log::error!("Failed to apply book deltas for {instrument_id}: {e}");
+                            }
+                        }
+                    }
+                    delta_batches.push(deltas);
+                }
+            }
+
+            let mut staged_quotes: Vec<(InstrumentId, QuoteTick)> = Vec::new();
+            for (meta, change) in resolved {
+                let instrument_id = meta.instrument_id;
+
                 if ctx.active_quote_subs.contains(&instrument_id) {
                     let price_increment = {
                         let instruments = ctx.instruments.load();
-                        let Some(instrument) = instruments.get(&instrument_id) else {
-                            log::error!("No instrument for {instrument_id}");
-                            continue;
-                        };
-                        instrument.price_increment()
+                        instruments
+                            .get(&instrument_id)
+                            .map(Instrument::price_increment)
                     };
-                    // Clone and drop guard before emit to avoid DashMap deadlock
-                    let last_quote = ctx.last_quotes.get(&instrument_id).map(|r| *r);
+                    let Some(price_increment) = price_increment else {
+                        frame_valid = false;
+                        log::error!("No instrument for {instrument_id}");
+                        continue;
+                    };
+                    let last_quote = staged_quotes
+                        .iter()
+                        .rev()
+                        .find(|(existing_id, _)| *existing_id == instrument_id)
+                        .map(|(_, quote)| quote)
+                        .copied()
+                        .or_else(|| ctx.last_quotes.get(&instrument_id).map(|quote| *quote));
 
                     match parse_quote_from_price_change(
                         change,
@@ -369,14 +471,21 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                         ts_event,
                         ts_init,
                     ) {
-                        Ok(Some(quote)) => {
-                            emit_quote_if_changed(ctx, instrument_id, quote);
-                        }
+                        Ok(Some(quote)) => staged_quotes.push((instrument_id, quote)),
                         Ok(None) => {}
                         Err(e) => {
+                            frame_valid = false;
                             log::error!("Failed to parse quote from price change: {e}");
                         }
                     }
+                }
+            }
+
+            let frame_emitted =
+                frame_valid && emit_l2_frame(ctx, delta_batches, staged_books, ts_event, ts_init);
+            if !frame_valid || frame_emitted {
+                for (instrument_id, quote) in staged_quotes {
+                    emit_quote_if_changed(ctx, instrument_id, quote);
                 }
             }
         }
@@ -799,6 +908,7 @@ mod tests {
             enums::PolymarketOrderSide,
         },
         config::PolymarketDataClientConfig,
+        data_types::PolymarketFrameCommit,
         http::data_api::PolymarketDataApiHttpClient,
         resolve::{
             PolymarketResolveRequestSummaryData, RESOLVE_REQUEST_TYPE_NAME, ResolveBatchErrorMode,
@@ -817,6 +927,13 @@ mod tests {
 
     fn is_resolve_response(event: &DataEvent) -> bool {
         matches!(event, DataEvent::Response(DataResponse::Data(_)))
+    }
+
+    fn frame_commit(event: &DataEvent) -> Option<&PolymarketFrameCommit> {
+        let DataEvent::Data(NautilusData::Custom(custom)) = event else {
+            return None;
+        };
+        custom.data.as_any().downcast_ref::<PolymarketFrameCommit>()
     }
 
     type CacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -965,6 +1082,7 @@ mod tests {
         let ctx = WsMessageContext {
             clock: get_atomic_clock_realtime(),
             data_sender: data_tx.clone(),
+            frame_counter: Arc::new(AtomicU64::new(0)),
             token_meta: Arc::new(DashMap::new()),
             instruments: Arc::new(AtomicMap::new()),
             gamma_client,
@@ -1102,6 +1220,7 @@ mod tests {
         WsMessageContext {
             clock: client.clock,
             data_sender: client.data_sender.clone(),
+            frame_counter: client.frame_counter.clone(),
             token_meta: client.token_meta.clone(),
             instruments: client.instruments.clone(),
             gamma_client: client.provider.http_client().clone(),
@@ -3565,6 +3684,30 @@ mod tests {
     }
 
     #[rstest]
+    fn book_snapshot_emits_delta_then_one_frame_commit() {
+        let asset_id = "0xTOKEN-FRAME-BOOK";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot("0xMARKET", asset_id, &[("0.49", "10"), ("0.51", "10")]),
+            &ctx,
+        );
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            DataEvent::Data(NautilusData::Deltas(_))
+        ));
+        let commit = frame_commit(&events[1]).expect("frame commit after snapshot deltas");
+        assert_eq!(commit.frame_id(), 1);
+        assert_eq!(commit.affected_instrument_ids(), &[instrument_id]);
+    }
+
+    #[rstest]
     fn price_change_emits_delta_when_not_pending() {
         let asset_id_str = "0xTOKEN10";
         let market = "0xMARKET";
@@ -3698,6 +3841,19 @@ mod tests {
         assert_eq!(batches[0].deltas.len(), 3);
         assert_eq!(batches[1].instrument_id, instrument_b);
         assert_eq!(batches[1].deltas.len(), 3);
+        let commit_index = events
+            .iter()
+            .position(|event| frame_commit(event).is_some())
+            .expect("frame commit");
+        assert_eq!(
+            commit_index, 2,
+            "commit must immediately follow both batches"
+        );
+        let commit = frame_commit(&events[commit_index]).expect("frame commit");
+        let mut expected_ids = vec![instrument_a, instrument_b];
+        expected_ids.sort_unstable();
+        assert_eq!(commit.affected_instrument_ids(), expected_ids);
+        assert_eq!(commit.frame_id(), 3, "two snapshots committed first");
         assert_eq!(
             quote_instruments,
             vec![instrument_a, instrument_b, instrument_a, instrument_b]
@@ -3711,7 +3867,7 @@ mod tests {
     }
 
     #[rstest]
-    fn malformed_price_change_entry_preserves_other_updates() {
+    fn malformed_price_change_entry_rejects_entire_frame() {
         let asset_a = "0xTOKEN-BAD";
         let asset_b = "0xTOKEN-GOOD";
         let market = Ustr::from("0xMARKET");
@@ -3781,23 +3937,21 @@ mod tests {
         );
 
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
-        let batches: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                DataEvent::Data(NautilusData::Deltas(deltas)) => Some(deltas),
-                _ => None,
-            })
-            .collect();
         let book_a = ctx.order_books.get(&instrument_a).expect("book A");
         let book_b = ctx.order_books.get(&instrument_b).expect("book B");
 
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].instrument_id, instrument_a);
-        assert_eq!(batches[0].deltas.len(), 1);
-        assert_eq!(batches[1].instrument_id, instrument_b);
-        assert_eq!(batches[1].deltas.len(), 1);
-        assert_eq!(book_a.best_bid_price(), Some(Price::from("0.004")));
-        assert_eq!(book_b.best_bid_price(), Some(Price::from("0.994")));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, DataEvent::Data(NautilusData::Deltas(_)))),
+            "invalid frame emitted deltas: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| frame_commit(event).is_some()),
+            "invalid frame must not emit a commit: {events:?}",
+        );
+        assert_eq!(book_a.best_bid_price(), Some(Price::from("0.003")));
+        assert_eq!(book_b.best_bid_price(), Some(Price::from("0.993")));
         assert!(
             !ctx.pending_snapshot_after_tick_change
                 .contains(&instrument_a)
