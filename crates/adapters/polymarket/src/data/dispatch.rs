@@ -700,9 +700,8 @@ fn handle_market_message_from_source(
                 let ready = incremental_source_is_ready(ctx, instrument_id, source);
 
                 if active && !ready {
-                    frame_valid = false;
                     log::debug!(
-                        "Dropping book deltas for {instrument_id}: source is not snapshot-ready",
+                        "Ignoring pre-snapshot price changes for {instrument_id} until its baseline snapshot arrives",
                     );
                 }
 
@@ -4546,6 +4545,95 @@ mod tests {
         assert_eq!(book_b.best_ask_price(), Some(Price::from("0.999")));
         assert!(nautilus_model::orderbook::analysis::book_check_integrity(&book_a).is_ok());
         assert!(nautilus_model::orderbook::analysis::book_check_integrity(&book_b).is_ok());
+    }
+
+    #[rstest]
+    fn pending_member_does_not_revoke_ready_sibling_in_valid_frame() {
+        let asset_ready = "0xTOKEN-READY";
+        let asset_pending = "0xTOKEN-PENDING";
+        let market = Ustr::from("0xMARKET");
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_ready = seed_instrument(
+            &ctx,
+            asset_ready,
+            Price::from("0.001"),
+            Quantity::from("0.01"),
+        )
+        .id();
+        let instrument_pending = seed_instrument(
+            &ctx,
+            asset_pending,
+            Price::from("0.001"),
+            Quantity::from("0.01"),
+        )
+        .id();
+        ctx.active_delta_subs.insert(instrument_ready);
+        ctx.active_delta_subs.insert(instrument_pending);
+        ctx.pending_snapshot_after_tick_change
+            .insert(instrument_pending);
+
+        handle_market_message(
+            make_snapshot(
+                market.as_str(),
+                asset_ready,
+                &[("0.003", "10"), ("0.005", "10")],
+            ),
+            &ctx,
+        );
+        while data_rx.try_recv().is_ok() {}
+
+        let price_changes = vec![
+            PolymarketQuote {
+                asset_id: Ustr::from(asset_ready),
+                price: "0.004".to_string(),
+                side: PolymarketOrderSide::Buy,
+                size: "20".to_string(),
+                hash: String::new(),
+                best_bid: None,
+                best_ask: None,
+            },
+            PolymarketQuote {
+                asset_id: Ustr::from(asset_pending),
+                price: "0.994".to_string(),
+                side: PolymarketOrderSide::Buy,
+                size: "20".to_string(),
+                hash: String::new(),
+                best_bid: None,
+                best_ask: None,
+            },
+        ];
+        handle_market_message(
+            MarketWsMessage::PriceChange(PolymarketQuotes {
+                market,
+                price_changes,
+                timestamp: "1700000003000".to_string(),
+            }),
+            &ctx,
+        );
+
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        let batches: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                DataEvent::Data(NautilusData::Deltas(deltas)) => Some(deltas),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].instrument_id, instrument_ready);
+        let commit = events
+            .iter()
+            .find_map(frame_commit)
+            .expect("ready sibling frame commit");
+        assert_eq!(commit.affected_instrument_ids(), &[instrument_ready]);
+        assert!(ctx.order_books.contains_key(&instrument_ready));
+        assert!(!ctx.order_books.contains_key(&instrument_pending));
+        assert!(ctx.ready_book_sources.contains_key(&instrument_ready));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_pending)
+        );
+        assert!(events.iter().all(|event| book_readiness(event).is_none()));
     }
 
     #[rstest]
