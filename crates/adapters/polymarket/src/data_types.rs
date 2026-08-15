@@ -33,6 +33,8 @@ use crate::http::models::{GammaEvent, GammaMarket, GammaTag};
 
 /// Type name published for [`PolymarketFrameCommit`] custom data.
 pub const POLYMARKET_FRAME_COMMIT_TYPE_NAME: &str = "PolymarketFrameCommit";
+/// Type name published for [`PolymarketBookReadiness`] custom data.
+pub const POLYMARKET_BOOK_READINESS_TYPE_NAME: &str = "PolymarketBookReadiness";
 
 /// Type name returned for complete Gamma event-container snapshots.
 pub const POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME: &str =
@@ -52,6 +54,8 @@ const MAX_DEFINITION_TEXT_BYTES: usize = 4_096;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolymarketFrameCommit {
     frame_id: u64,
+    shard_id: u64,
+    connection_generation: u64,
     affected_instrument_ids: Vec<InstrumentId>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
@@ -60,11 +64,14 @@ pub struct PolymarketFrameCommit {
 impl PolymarketFrameCommit {
     pub(crate) fn new(
         frame_id: u64,
+        shard_id: u64,
+        connection_generation: u64,
         affected_instrument_ids: Vec<InstrumentId>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
     ) -> Self {
         debug_assert!(frame_id > 0);
+        debug_assert!(connection_generation > 0);
         debug_assert!(!affected_instrument_ids.is_empty());
         debug_assert!(affected_instrument_ids.is_sorted());
         debug_assert!(
@@ -74,6 +81,8 @@ impl PolymarketFrameCommit {
         );
         Self {
             frame_id,
+            shard_id,
+            connection_generation,
             affected_instrument_ids,
             ts_event,
             ts_init,
@@ -84,6 +93,18 @@ impl PolymarketFrameCommit {
     #[must_use]
     pub const fn frame_id(&self) -> u64 {
         self.frame_id
+    }
+
+    /// Returns the adapter-local market WebSocket shard identifier.
+    #[must_use]
+    pub const fn shard_id(&self) -> u64 {
+        self.shard_id
+    }
+
+    /// Returns the non-zero generation derived from the exact transport connection epoch.
+    #[must_use]
+    pub const fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 
     /// Returns the canonical sorted instrument IDs affected by this frame.
@@ -138,6 +159,10 @@ impl CustomDataTrait for PolymarketFrameCommit {
         let commit = serde_json::from_value::<Self>(value)?;
         anyhow::ensure!(commit.frame_id > 0, "frame_id must be non-zero");
         anyhow::ensure!(
+            commit.connection_generation > 0,
+            "connection_generation must be non-zero",
+        );
+        anyhow::ensure!(
             !commit.affected_instrument_ids.is_empty(),
             "affected_instrument_ids must not be empty",
         );
@@ -150,6 +175,224 @@ impl CustomDataTrait for PolymarketFrameCommit {
             "affected_instrument_ids must be sorted and unique",
         );
         Ok(Arc::new(commit))
+    }
+}
+
+/// Readiness phase for one Polymarket L2 book source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolymarketBookReadinessState {
+    /// Incremental updates are suppressed until a full snapshot is accepted.
+    AwaitingSnapshot,
+    /// A full snapshot from the exact current connection generation was accepted.
+    Ready,
+}
+
+/// Cause of one immutable book-readiness transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PolymarketBookReadinessReason {
+    /// A local L2 subscription began or restarted and awaits its first full snapshot.
+    Subscribed,
+    /// The managed market transport became unavailable.
+    ConnectionUnavailable,
+    /// The owning market WebSocket shard advanced to a replacement connection.
+    ConnectionEpochAdvanced,
+    /// A market frame was malformed or could not be applied atomically.
+    MalformedFrame,
+    /// The local L2 subscription was retired.
+    Unsubscribed,
+    /// The data client is disconnecting.
+    Disconnected,
+    /// Venue tick-size evidence retired the prior book grid.
+    TickSizeChanged,
+    /// A full venue snapshot established the current book source.
+    SnapshotAccepted,
+}
+
+/// Immutable per-instrument Polymarket L2 readiness transition.
+///
+/// This is descriptive adapter evidence. Event-wide readiness remains owned by the application
+/// projector, which joins every required instrument in a complete topology at a frame commit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketBookReadiness {
+    instrument_id: InstrumentId,
+    shard_id: u64,
+    connection_generation: u64,
+    book_epoch: u64,
+    state: PolymarketBookReadinessState,
+    reason: PolymarketBookReadinessReason,
+    snapshot_frame_id: Option<u64>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl PolymarketBookReadiness {
+    pub(crate) fn awaiting_snapshot(
+        instrument_id: InstrumentId,
+        shard_id: u64,
+        connection_generation: u64,
+        book_epoch: u64,
+        reason: PolymarketBookReadinessReason,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> Self {
+        debug_assert!(connection_generation > 0);
+        debug_assert!(book_epoch > 0);
+        debug_assert!(reason != PolymarketBookReadinessReason::SnapshotAccepted);
+        Self {
+            instrument_id,
+            shard_id,
+            connection_generation,
+            book_epoch,
+            state: PolymarketBookReadinessState::AwaitingSnapshot,
+            reason,
+            snapshot_frame_id: None,
+            ts_event,
+            ts_init,
+        }
+    }
+
+    pub(crate) fn ready(
+        instrument_id: InstrumentId,
+        shard_id: u64,
+        connection_generation: u64,
+        book_epoch: u64,
+        snapshot_frame_id: u64,
+        ts_event: UnixNanos,
+        ts_init: UnixNanos,
+    ) -> Self {
+        debug_assert!(connection_generation > 0);
+        debug_assert!(book_epoch > 0);
+        debug_assert!(snapshot_frame_id > 0);
+        Self {
+            instrument_id,
+            shard_id,
+            connection_generation,
+            book_epoch,
+            state: PolymarketBookReadinessState::Ready,
+            reason: PolymarketBookReadinessReason::SnapshotAccepted,
+            snapshot_frame_id: Some(snapshot_frame_id),
+            ts_event,
+            ts_init,
+        }
+    }
+
+    /// Returns the affected instrument.
+    #[must_use]
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+
+    /// Returns the owning market WebSocket shard.
+    #[must_use]
+    pub const fn shard_id(&self) -> u64 {
+        self.shard_id
+    }
+
+    /// Returns the exact non-zero connection generation.
+    #[must_use]
+    pub const fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
+    /// Returns the instrument-local book epoch.
+    #[must_use]
+    pub const fn book_epoch(&self) -> u64 {
+        self.book_epoch
+    }
+
+    /// Returns the readiness phase.
+    #[must_use]
+    pub const fn state(&self) -> PolymarketBookReadinessState {
+        self.state
+    }
+
+    /// Returns the transition reason.
+    #[must_use]
+    pub const fn reason(&self) -> PolymarketBookReadinessReason {
+        self.reason
+    }
+
+    /// Returns the snapshot frame that established readiness, when ready.
+    #[must_use]
+    pub const fn snapshot_frame_id(&self) -> Option<u64> {
+        self.snapshot_frame_id
+    }
+
+    /// Returns the event timestamp assigned to the transition.
+    #[must_use]
+    pub const fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.connection_generation > 0,
+            "connection_generation must be non-zero",
+        );
+        anyhow::ensure!(self.book_epoch > 0, "book_epoch must be non-zero");
+        match (self.state, self.reason, self.snapshot_frame_id) {
+            (
+                PolymarketBookReadinessState::AwaitingSnapshot,
+                PolymarketBookReadinessReason::Subscribed
+                | PolymarketBookReadinessReason::ConnectionUnavailable
+                | PolymarketBookReadinessReason::ConnectionEpochAdvanced
+                | PolymarketBookReadinessReason::MalformedFrame
+                | PolymarketBookReadinessReason::Unsubscribed
+                | PolymarketBookReadinessReason::Disconnected
+                | PolymarketBookReadinessReason::TickSizeChanged,
+                None,
+            )
+            | (
+                PolymarketBookReadinessState::Ready,
+                PolymarketBookReadinessReason::SnapshotAccepted,
+                Some(1..),
+            ) => Ok(()),
+            _ => anyhow::bail!("invalid book readiness state/reason/frame combination"),
+        }
+    }
+}
+
+impl HasTsInit for PolymarketBookReadiness {
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+}
+
+impl CustomDataTrait for PolymarketBookReadiness {
+    fn type_name(&self) -> &'static str {
+        POLYMARKET_BOOK_READINESS_TYPE_NAME
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+        Arc::new(self.clone())
+    }
+
+    fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn type_name_static() -> &'static str {
+        POLYMARKET_BOOK_READINESS_TYPE_NAME
+    }
+
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Arc<dyn CustomDataTrait>> {
+        let readiness = serde_json::from_value::<Self>(value)?;
+        readiness.validate()?;
+        Ok(Arc::new(readiness))
     }
 }
 
@@ -915,6 +1158,7 @@ pub struct PolymarketRtdsEquityPrice {
 /// Safe to call multiple times (idempotent via internal `Once` guards).
 pub fn register_polymarket_custom_data() {
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketFrameCommit>();
+    let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketBookReadiness>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<
         PolymarketEventDefinitionSnapshot,
     >();

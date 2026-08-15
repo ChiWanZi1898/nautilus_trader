@@ -80,6 +80,8 @@ pub(super) struct FeedHandler {
     user_evidence_sequence: Arc<AtomicU64>,
     user_session_epoch: u64,
     user_frame_sequence: u64,
+    last_transport_epoch: u64,
+    connection_unavailable_reported: bool,
 }
 
 impl FeedHandler {
@@ -121,6 +123,8 @@ impl FeedHandler {
             user_evidence_sequence,
             user_session_epoch,
             user_frame_sequence: 1,
+            last_transport_epoch: 0,
+            connection_unavailable_reported: false,
         }
     }
 
@@ -286,20 +290,25 @@ impl FeedHandler {
         match self.channel {
             WsChannel::Market => {
                 if let Ok(msgs) = serde_json::from_str::<Vec<&RawValue>>(text) {
-                    msgs.into_iter()
-                        .filter_map(|raw| match MarketWsMessage::parse(raw.get()) {
-                            Ok(msg) => Some(PolymarketWsMessage::Market(msg)),
-                            Err(e) => {
-                                log::warn!("Failed to parse market WS batch element: {e}");
-                                None
-                            }
-                        })
-                        .collect()
+                    let parsed = msgs
+                        .into_iter()
+                        .map(|raw| MarketWsMessage::parse(raw.get()))
+                        .collect::<Result<Vec<_>, _>>();
+                    match parsed {
+                        Ok(messages) => messages
+                            .into_iter()
+                            .map(PolymarketWsMessage::Market)
+                            .collect(),
+                        Err(e) => {
+                            log::warn!("Failed to parse Polymarket market WS batch: {e}");
+                            vec![PolymarketWsMessage::MalformedMarketFrame]
+                        }
+                    }
                 } else if let Ok(msg) = MarketWsMessage::parse(text) {
                     vec![PolymarketWsMessage::Market(msg)]
                 } else {
-                    log::warn!("Failed to parse market WS message: {text}");
-                    vec![]
+                    log::warn!("Failed to parse Polymarket market WS message");
+                    vec![PolymarketWsMessage::MalformedMarketFrame]
                 }
             }
             WsChannel::User => {
@@ -316,12 +325,49 @@ impl FeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<PolymarketConnectionMessage> {
+        if self.channel == WsChannel::Market
+            && !self.connection_unavailable_reported
+            && self
+                .client
+                .as_ref()
+                .is_some_and(WebSocketClient::is_reconnecting)
+        {
+            self.connection_unavailable_reported = true;
+            return Some(PolymarketConnectionMessage {
+                transport_epoch: self.last_transport_epoch,
+                message: PolymarketWsMessage::ConnectionUnavailable,
+            });
+        }
         if !self.message_buffer.is_empty() {
             return Some(self.message_buffer.remove(0));
         }
 
         loop {
+            if self.channel == WsChannel::Market
+                && !self.connection_unavailable_reported
+                && self
+                    .client
+                    .as_ref()
+                    .is_some_and(WebSocketClient::is_reconnecting)
+            {
+                self.connection_unavailable_reported = true;
+                return Some(PolymarketConnectionMessage {
+                    transport_epoch: self.last_transport_epoch,
+                    message: PolymarketWsMessage::ConnectionUnavailable,
+                });
+            }
             tokio::select! {
+                () = tokio::time::sleep(tokio::time::Duration::from_millis(5)), if self.channel == WsChannel::Market => {
+                    if !self.connection_unavailable_reported
+                        && self.client.as_ref().is_some_and(WebSocketClient::is_reconnecting)
+                    {
+                        self.connection_unavailable_reported = true;
+                        return Some(PolymarketConnectionMessage {
+                            transport_epoch: self.last_transport_epoch,
+                            message: PolymarketWsMessage::ConnectionUnavailable,
+                        });
+                    }
+                }
                 Some(cmd) = self.cmd_rx.recv() => {
                     match cmd {
                         HandlerCommand::SetClient(client) => {
@@ -356,9 +402,11 @@ impl FeedHandler {
                     }
                 }
                 Some((transport_epoch, raw)) = self.raw_rx.recv() => {
+                    self.last_transport_epoch = transport_epoch;
                     match raw {
                         Message::Text(text) => {
                             if text == RECONNECTED {
+                                self.connection_unavailable_reported = false;
                                 if self.channel == WsChannel::User {
                                     let next_epoch = self.user_session_epoch_counter.fetch_update(
                                         Ordering::SeqCst,
@@ -766,7 +814,7 @@ mod tests {
 
     #[rstest]
     #[tokio::test]
-    async fn market_batch_members_retain_the_raw_transport_epoch() {
+    async fn malformed_market_batch_retains_epoch_and_releases_no_sibling() {
         let (mut handler, raw_tx) = market_handler_with_raw();
         raw_tx
             .send((
@@ -779,54 +827,26 @@ mod tests {
             ))
             .expect("send raw market frame");
 
-        let first = handler.next().await.expect("first parsed member");
-        let second = handler.next().await.expect("second parsed member");
-        assert_eq!(first.transport_epoch, 7);
-        assert_eq!(second.transport_epoch, 7);
+        let message = handler.next().await.expect("malformed-frame marker");
+        assert_eq!(message.transport_epoch, 7);
+        assert!(matches!(
+            message.message,
+            PolymarketWsMessage::MalformedMarketFrame
+        ));
+        assert!(handler.message_buffer.is_empty());
     }
 
     #[rstest]
-    fn test_parse_market_batch_skips_unknown_event(market_handler: FeedHandler) {
+    fn test_parse_market_batch_rejects_unknown_event_atomically(market_handler: FeedHandler) {
         let messages = market_handler.parse_messages(include_str!(
             "../../test_data/ws_market_mixed_known_unknown.json"
         ));
 
-        assert_eq!(messages.len(), 2);
-
-        let PolymarketWsMessage::Market(MarketWsMessage::PriceChange(quotes)) = &messages[0] else {
-            panic!("Expected first message to be a price change");
-        };
-        assert_eq!(
-            quotes.market.as_str(),
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        assert_eq!(quotes.timestamp, "1700000000001");
-        assert_eq!(quotes.price_changes.len(), 1);
-
-        let quote = &quotes.price_changes[0];
-        assert_eq!(quote.asset_id.as_str(), "101");
-        assert_eq!(quote.price, "0.37");
-        assert_eq!(quote.side, PolymarketOrderSide::Buy);
-        assert_eq!(quote.size, "12.5");
-        assert_eq!(quote.hash, "price-change-hash");
-        assert_eq!(quote.best_bid.as_deref(), Some("0.36"));
-        assert_eq!(quote.best_ask.as_deref(), Some("0.38"));
-
-        let PolymarketWsMessage::Market(MarketWsMessage::LastTradePrice(trade)) = &messages[1]
-        else {
-            panic!("Expected second message to be a last trade price");
-        };
-        assert_eq!(
-            trade.market.as_str(),
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
-        assert_eq!(trade.asset_id.as_str(), "202");
-        assert_eq!(trade.fee_rate_bps, "17");
-        assert_eq!(trade.price, "0.63");
-        assert_eq!(trade.side, PolymarketOrderSide::Sell);
-        assert_eq!(trade.size, "4.25");
-        assert_eq!(trade.timestamp, "1700000000003");
-        assert_eq!(trade.transaction_hash.as_deref(), Some("0xtrade-hash"));
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            messages[0],
+            PolymarketWsMessage::MalformedMarketFrame
+        ));
     }
 
     #[rstest]

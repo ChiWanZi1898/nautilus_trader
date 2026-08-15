@@ -90,6 +90,11 @@ impl PolymarketDataClient {
             resolve_poll_watchlist: self.resolve_poll_watchlist.clone(),
             resolve_watch_apply_mutex: self.resolve_watch_apply_mutex.clone(),
             pending_snapshot_after_tick_change: self.pending_snapshot_after_tick_change.clone(),
+            expected_book_sources: self.expected_book_sources.clone(),
+            ready_book_sources: self.ready_book_sources.clone(),
+            book_epochs: self.book_epochs.clone(),
+            book_readiness_mutex: self.book_readiness_mutex.clone(),
+            market_data_shutdown: self.market_data_shutdown.clone(),
             new_market_inflight_keys: self.new_market_inflight_keys.clone(),
             new_market_fetch_semaphore: self.new_market_fetch_semaphore.clone(),
             rtds_feed: self.rtds_feed.clone(),
@@ -165,6 +170,11 @@ impl PolymarketDataClient {
             resolve_poll_watchlist: self.resolve_poll_watchlist.clone(),
             resolve_watch_apply_mutex: self.resolve_watch_apply_mutex.clone(),
             pending_snapshot_after_tick_change: self.pending_snapshot_after_tick_change.clone(),
+            expected_book_sources: self.expected_book_sources.clone(),
+            ready_book_sources: self.ready_book_sources.clone(),
+            book_epochs: self.book_epochs.clone(),
+            book_readiness_mutex: self.book_readiness_mutex.clone(),
+            market_data_shutdown: self.market_data_shutdown.clone(),
             new_market_inflight_keys: self.new_market_inflight_keys.clone(),
             new_market_fetch_semaphore: self.new_market_fetch_semaphore.clone(),
             rtds_feed: self.rtds_feed.clone(),
@@ -291,6 +301,8 @@ impl PolymarketDataClient {
 
     pub(super) fn stop_client(&mut self) {
         log::info!("Stopping Polymarket data client: {}", self.client_id);
+        self.market_data_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation_token.cancel();
         self.is_connected
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -299,6 +311,8 @@ impl PolymarketDataClient {
 
     pub(super) fn reset_client(&mut self) {
         log::debug!("Resetting Polymarket data client: {}", self.client_id);
+        self.market_data_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
         self.cancellation_token.cancel();
         self.is_connected
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -326,6 +340,11 @@ impl PolymarketDataClient {
         self.active_delta_subs = std::sync::Arc::new(AtomicSet::new());
         self.active_trade_subs = std::sync::Arc::new(AtomicSet::new());
         self.pending_snapshot_after_tick_change = std::sync::Arc::new(AtomicSet::new());
+        self.expected_book_sources = std::sync::Arc::new(DashMap::new());
+        self.ready_book_sources = std::sync::Arc::new(DashMap::new());
+        self.book_epochs = std::sync::Arc::new(DashMap::new());
+        self.book_readiness_mutex = std::sync::Arc::new(std::sync::Mutex::new(()));
+        self.market_data_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.new_market_inflight_keys = std::sync::Arc::new(DashMap::new());
         self.ws_open_tokens = std::sync::Arc::new(AtomicSet::new());
         self.rtds_feed = crate::rtds::PolymarketRtdsFeed::new_with_proxy(
@@ -352,6 +371,8 @@ impl PolymarketDataClient {
         }
 
         self.cancellation_token = tokio_util::sync::CancellationToken::new();
+        self.market_data_shutdown
+            .store(false, std::sync::atomic::Ordering::Release);
         self.ensure_position_event_subscription();
         register_polymarket_custom_data();
 
@@ -397,6 +418,22 @@ impl PolymarketDataClient {
         }
 
         log::info!("Disconnecting Polymarket data client");
+
+        self.market_data_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let active_books = self
+            .active_delta_subs
+            .load()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for instrument_id in active_books {
+            self.invalidate_book_readiness(
+                instrument_id,
+                crate::data_types::PolymarketBookReadinessReason::Disconnected,
+            );
+        }
 
         self.cancellation_token.cancel();
         self.await_tasks_with_timeout(tokio::time::Duration::from_secs(5))

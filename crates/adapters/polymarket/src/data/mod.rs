@@ -97,6 +97,12 @@ fn clamp_new_market_fetch_max_concurrency(value: usize) -> usize {
     value.clamp(1, NEW_MARKET_FETCH_MAX_CONCURRENCY_CAP)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct BookSource {
+    pub(super) shard_id: u64,
+    pub(super) connection_generation: u64,
+}
+
 /// Polymarket data client for live market data streaming.
 ///
 /// Integrates with the Nautilus DataEngine to provide:
@@ -128,6 +134,11 @@ pub struct PolymarketDataClient {
     resolve_poll_watchlist: Arc<AtomicMap<String, ResolveWatchEntry>>,
     resolve_watch_apply_mutex: Arc<StdMutex<()>>,
     pending_snapshot_after_tick_change: Arc<AtomicSet<InstrumentId>>,
+    expected_book_sources: Arc<DashMap<InstrumentId, BookSource>>,
+    ready_book_sources: Arc<DashMap<InstrumentId, BookSource>>,
+    book_epochs: Arc<DashMap<InstrumentId, u64>>,
+    book_readiness_mutex: Arc<StdMutex<()>>,
+    market_data_shutdown: Arc<AtomicBool>,
     new_market_inflight_keys: Arc<DashMap<String, ()>>,
     new_market_fetch_semaphore: Arc<tokio::sync::Semaphore>,
     ws_open_tokens: Arc<AtomicSet<Ustr>>,
@@ -140,6 +151,61 @@ pub struct PolymarketDataClient {
 }
 
 impl PolymarketDataClient {
+    pub(super) fn invalidate_book_readiness(
+        &self,
+        instrument_id: InstrumentId,
+        reason: crate::data_types::PolymarketBookReadinessReason,
+    ) {
+        let _readiness_guard = self
+            .book_readiness_mutex
+            .lock()
+            .expect("book readiness mutex poisoned");
+        self.order_books.remove(&instrument_id);
+        self.last_quotes.remove(&instrument_id);
+        self.pending_snapshot_after_tick_change
+            .insert(instrument_id);
+        let source = self
+            .ready_book_sources
+            .remove(&instrument_id)
+            .map(|(_, source)| source)
+            .or_else(|| {
+                self.expected_book_sources
+                    .get(&instrument_id)
+                    .map(|source| *source)
+            });
+        let next_epoch = if let Some(epoch) = self.book_epochs.get(&instrument_id) {
+            let Some(next_epoch) = epoch.checked_add(1) else {
+                log::error!("Polymarket book epoch exhausted for {instrument_id}");
+                return;
+            };
+            next_epoch
+        } else {
+            1
+        };
+        self.book_epochs.insert(instrument_id, next_epoch);
+        let Some(source) = source else {
+            return;
+        };
+        self.expected_book_sources.insert(instrument_id, source);
+        let ts_init = self.clock.get_time_ns();
+        let readiness = crate::data_types::PolymarketBookReadiness::awaiting_snapshot(
+            instrument_id,
+            source.shard_id,
+            source.connection_generation,
+            next_epoch,
+            reason,
+            ts_init,
+            ts_init,
+        );
+        let custom = nautilus_model::data::CustomData::from_arc(Arc::new(readiness));
+        if let Err(e) = self
+            .data_sender
+            .send(DataEvent::Data(nautilus_model::data::Data::Custom(custom)))
+        {
+            log::error!("Failed to emit Polymarket book invalidation: {e}");
+        }
+    }
+
     /// Creates a new [`PolymarketDataClient`].
     pub fn new(
         client_id: ClientId,
@@ -216,6 +282,11 @@ impl PolymarketDataClient {
             resolve_poll_watchlist: Arc::new(AtomicMap::new()),
             resolve_watch_apply_mutex: Arc::new(StdMutex::new(())),
             pending_snapshot_after_tick_change: Arc::new(AtomicSet::new()),
+            expected_book_sources: Arc::new(DashMap::new()),
+            ready_book_sources: Arc::new(DashMap::new()),
+            book_epochs: Arc::new(DashMap::new()),
+            book_readiness_mutex: Arc::new(StdMutex::new(())),
+            market_data_shutdown: Arc::new(AtomicBool::new(false)),
             new_market_inflight_keys: Arc::new(DashMap::new()),
             new_market_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 fetch_max_concurrency,
@@ -490,7 +561,14 @@ impl DataClient for PolymarketDataClient {
         }
 
         // Mark intent before routing so unsubscribe can race-safely clear it.
+        let already_active = self.active_delta_subs.contains(&instrument_id);
         self.active_delta_subs.insert(instrument_id);
+        if !already_active {
+            self.invalidate_book_readiness(
+                instrument_id,
+                crate::data_types::PolymarketBookReadinessReason::Subscribed,
+            );
+        }
         self.order_books
             .entry(instrument_id)
             .or_insert_with(|| OrderBook::new(instrument_id, BookType::L2_MBP));
@@ -572,8 +650,10 @@ impl DataClient for PolymarketDataClient {
     fn unsubscribe_book_deltas(&mut self, cmd: &UnsubscribeBookDeltas) -> anyhow::Result<()> {
         let instrument_id = cmd.instrument_id;
         self.active_delta_subs.remove(&instrument_id);
-        self.pending_snapshot_after_tick_change
-            .remove(&instrument_id);
+        self.invalidate_book_readiness(
+            instrument_id,
+            crate::data_types::PolymarketBookReadinessReason::Unsubscribed,
+        );
         self.drop_pending_if_unwanted(instrument_id);
         self.drop_local_book_state_if_unwanted(instrument_id);
         self.sync_ws_subscription(instrument_id);

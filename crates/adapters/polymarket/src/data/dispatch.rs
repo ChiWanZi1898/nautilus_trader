@@ -15,10 +15,10 @@
 
 //! WebSocket market-message dispatch for the Polymarket data client.
 //!
-//! Tick-size changes are handled as book epoch transitions: the local order
-//! book is dropped, incremental `price_change` deltas are gated through
-//! `pending_snapshot_after_tick_change`, and the gate clears once the next
-//! venue snapshot reseeds the book under the new precision. The quote arm of
+//! Initial subscriptions, replacement connections, and tick-size changes are handled as book
+//! epoch transitions: the local order book is dropped, incremental `price_change` deltas are gated
+//! through `pending_snapshot_after_tick_change` (the retained historical name), and the gate clears
+//! only when a venue snapshot from the exact expected source reseeds the book. The quote arm of
 //! `price_change` stays open through the gap because each payload carries
 //! `best_bid` / `best_ask` on the new grid; `last_quotes` is preserved so the
 //! unchanged side's size carries forward. See
@@ -46,11 +46,11 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{
-    NEW_MARKET_EMPTY_RECHECK_DELAY, NEW_MARKET_EMPTY_RECHECK_MAX_ATTEMPTS,
+    BookSource, NEW_MARKET_EMPTY_RECHECK_DELAY, NEW_MARKET_EMPTY_RECHECK_MAX_ATTEMPTS,
     instruments::{TokenMeta, cache_instrument_if_active},
 };
 use crate::{
-    data_types::PolymarketFrameCommit,
+    data_types::{PolymarketBookReadiness, PolymarketBookReadinessReason, PolymarketFrameCommit},
     filters::InstrumentFilter,
     http::{
         clob::PolymarketClobPublicClient, gamma::PolymarketGammaHttpClient,
@@ -64,11 +64,18 @@ use crate::{
             parse_book_deltas, parse_book_snapshot, parse_quote_from_price_change,
             parse_quote_from_snapshot, parse_timestamp_ms, parse_trade_tick,
         },
-        pool::PolymarketMarketPoolEvent,
+        pool::{PolymarketMarketPoolEvent, PolymarketMarketSourceInvalidation},
     },
 };
 
 pub(super) fn handle_market_pool_event(event: PolymarketMarketPoolEvent, ctx: &WsMessageContext) {
+    let _readiness_guard = ctx
+        .book_readiness_mutex
+        .lock()
+        .expect("book readiness mutex poisoned");
+    if ctx.market_data_shutdown.load(Ordering::Acquire) {
+        return;
+    }
     match event {
         PolymarketMarketPoolEvent::Message {
             shard_id,
@@ -78,7 +85,14 @@ pub(super) fn handle_market_pool_event(event: PolymarketMarketPoolEvent, ctx: &W
             log::trace!(
                 "Dispatching Polymarket market shard {shard_id} generation {connection_generation}"
             );
-            handle_ws_message(message, ctx);
+            handle_ws_message_from_source(
+                message,
+                BookSource {
+                    shard_id,
+                    connection_generation,
+                },
+                ctx,
+            );
         }
         PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
             shard_id,
@@ -89,9 +103,85 @@ pub(super) fn handle_market_pool_event(event: PolymarketMarketPoolEvent, ctx: &W
                 "Polymarket market shard {shard_id} advanced to generation {connection_generation} with {} assigned assets",
                 assigned_asset_ids.len(),
             );
+            let source = BookSource {
+                shard_id,
+                connection_generation,
+            };
+            let ts_init = ctx.clock.get_time_ns();
+            for asset_id in assigned_asset_ids {
+                let Some(meta) = ctx.token_meta.get(&asset_id).map(|meta| *meta) else {
+                    continue;
+                };
+                let instrument_id = meta.instrument_id;
+                if !ctx.active_delta_subs.contains(&instrument_id) {
+                    continue;
+                }
+                ctx.order_books.remove(&instrument_id);
+                ctx.last_quotes.remove(&instrument_id);
+                ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+                ctx.ready_book_sources.remove(&instrument_id);
+                ctx.expected_book_sources.insert(instrument_id, source);
+                let Some(book_epoch) = advance_book_epoch(ctx, instrument_id) else {
+                    continue;
+                };
+                emit_book_readiness(
+                    ctx,
+                    PolymarketBookReadiness::awaiting_snapshot(
+                        instrument_id,
+                        shard_id,
+                        connection_generation,
+                        book_epoch,
+                        PolymarketBookReadinessReason::ConnectionEpochAdvanced,
+                        ts_init,
+                        ts_init,
+                    ),
+                );
+            }
             handle_ws_message(PolymarketWsMessage::Reconnected, ctx);
         }
+        PolymarketMarketPoolEvent::SourceInvalidated {
+            shard_id,
+            connection_generation,
+            assigned_asset_ids,
+            reason,
+        } => {
+            let reason = match reason {
+                PolymarketMarketSourceInvalidation::ConnectionUnavailable => {
+                    PolymarketBookReadinessReason::ConnectionUnavailable
+                }
+                PolymarketMarketSourceInvalidation::MalformedFrame => {
+                    PolymarketBookReadinessReason::MalformedFrame
+                }
+            };
+            invalidate_assigned_books(
+                ctx,
+                BookSource {
+                    shard_id,
+                    connection_generation,
+                },
+                &assigned_asset_ids,
+                reason,
+            );
+        }
     }
+}
+
+const LEGACY_BOOK_SOURCE: BookSource = BookSource {
+    shard_id: u64::MAX,
+    connection_generation: u64::MAX,
+};
+
+fn advance_book_epoch(ctx: &WsMessageContext, instrument_id: InstrumentId) -> Option<u64> {
+    let current = ctx
+        .book_epochs
+        .get(&instrument_id)
+        .map_or(0, |epoch| *epoch);
+    let Some(next) = current.checked_add(1) else {
+        log::error!("Polymarket book epoch exhausted for {instrument_id}");
+        return None;
+    };
+    ctx.book_epochs.insert(instrument_id, next);
+    Some(next)
 }
 
 struct NewMarketInflightGuard {
@@ -128,6 +218,11 @@ pub(super) struct WsMessageContext {
     pub(super) resolve_poll_watchlist: Arc<AtomicMap<String, ResolveWatchEntry>>,
     pub(super) resolve_watch_apply_mutex: Arc<StdMutex<()>>,
     pub(super) pending_snapshot_after_tick_change: Arc<AtomicSet<InstrumentId>>,
+    pub(super) expected_book_sources: Arc<DashMap<InstrumentId, BookSource>>,
+    pub(super) ready_book_sources: Arc<DashMap<InstrumentId, BookSource>>,
+    pub(super) book_epochs: Arc<DashMap<InstrumentId, u64>>,
+    pub(super) book_readiness_mutex: Arc<StdMutex<()>>,
+    pub(super) market_data_shutdown: Arc<std::sync::atomic::AtomicBool>,
     pub(super) new_market_inflight_keys: Arc<DashMap<String, ()>>,
     pub(super) new_market_fetch_semaphore: Arc<tokio::sync::Semaphore>,
     pub(super) rtds_feed: PolymarketRtdsFeed,
@@ -148,10 +243,80 @@ impl WsMessageContext {
     }
 }
 
+fn emit_book_readiness(ctx: &WsMessageContext, readiness: PolymarketBookReadiness) -> bool {
+    let custom = NautilusCustomData::from_arc(Arc::new(readiness));
+    if let Err(e) = ctx
+        .data_sender
+        .send(DataEvent::Data(NautilusData::Custom(custom)))
+    {
+        log::error!("Failed to emit Polymarket book readiness: {e}");
+        return false;
+    }
+    true
+}
+
+fn invalidate_book_source(
+    ctx: &WsMessageContext,
+    instrument_id: InstrumentId,
+    source: BookSource,
+    reason: PolymarketBookReadinessReason,
+) {
+    if ctx
+        .pending_snapshot_after_tick_change
+        .contains(&instrument_id)
+        && ctx
+            .expected_book_sources
+            .get(&instrument_id)
+            .is_some_and(|expected| *expected == source)
+        && !ctx.ready_book_sources.contains_key(&instrument_id)
+    {
+        return;
+    }
+    ctx.order_books.remove(&instrument_id);
+    ctx.last_quotes.remove(&instrument_id);
+    ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+    ctx.ready_book_sources.remove(&instrument_id);
+    ctx.expected_book_sources.insert(instrument_id, source);
+    let Some(book_epoch) = advance_book_epoch(ctx, instrument_id) else {
+        return;
+    };
+    let ts_init = ctx.clock.get_time_ns();
+    emit_book_readiness(
+        ctx,
+        PolymarketBookReadiness::awaiting_snapshot(
+            instrument_id,
+            source.shard_id,
+            source.connection_generation,
+            book_epoch,
+            reason,
+            ts_init,
+            ts_init,
+        ),
+    );
+}
+
+fn invalidate_assigned_books(
+    ctx: &WsMessageContext,
+    source: BookSource,
+    assigned_asset_ids: &[Ustr],
+    reason: PolymarketBookReadinessReason,
+) {
+    for asset_id in assigned_asset_ids {
+        let Some(meta) = ctx.token_meta.get(asset_id).map(|meta| *meta) else {
+            continue;
+        };
+        if ctx.active_delta_subs.contains(&meta.instrument_id) {
+            invalidate_book_source(ctx, meta.instrument_id, source, reason);
+        }
+    }
+}
+
 fn emit_l2_frame(
     ctx: &WsMessageContext,
+    source: BookSource,
     batches: Vec<OrderBookDeltas>,
     staged_books: Vec<(InstrumentId, OrderBook)>,
+    ready_instrument_ids: &[InstrumentId],
     ts_event: nautilus_core::UnixNanos,
     ts_init: nautilus_core::UnixNanos,
 ) -> bool {
@@ -166,6 +331,17 @@ fn emit_l2_frame(
     affected_instrument_ids.sort_unstable();
     affected_instrument_ids.dedup();
 
+    let Ok(previous_frame_id) =
+        ctx.frame_counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+    else {
+        log::error!("Polymarket market-data frame counter exhausted");
+        return false;
+    };
+    let frame_id = previous_frame_id + 1;
+
     for deltas in batches {
         let data: NautilusData = OrderBookDeltas_API::new(deltas).into();
         if let Err(e) = ctx.data_sender.send(DataEvent::Data(data)) {
@@ -178,18 +354,46 @@ fn emit_l2_frame(
         ctx.order_books.insert(instrument_id, book);
     }
 
-    let Ok(previous_frame_id) =
-        ctx.frame_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-    else {
-        log::error!("Polymarket market-data frame counter exhausted");
-        return false;
-    };
-    let frame_id = previous_frame_id + 1;
+    for instrument_id in ready_instrument_ids {
+        let book_epoch = ctx.book_epochs.get(instrument_id).map_or_else(
+            || {
+                if source == LEGACY_BOOK_SOURCE {
+                    ctx.book_epochs.insert(*instrument_id, 1);
+                    Some(1)
+                } else {
+                    None
+                }
+            },
+            |epoch| Some(*epoch),
+        );
+        let Some(book_epoch) = book_epoch else {
+            log::error!("Missing Polymarket book epoch for {instrument_id}");
+            return false;
+        };
+        if !emit_book_readiness(
+            ctx,
+            PolymarketBookReadiness::ready(
+                *instrument_id,
+                source.shard_id,
+                source.connection_generation,
+                book_epoch,
+                frame_id,
+                ts_event,
+                ts_init,
+            ),
+        ) {
+            return false;
+        }
+    }
 
-    let commit = PolymarketFrameCommit::new(frame_id, affected_instrument_ids, ts_event, ts_init);
+    let commit = PolymarketFrameCommit::new(
+        frame_id,
+        source.shard_id,
+        source.connection_generation,
+        affected_instrument_ids,
+        ts_event,
+        ts_init,
+    );
     let custom = NautilusCustomData::from_arc(Arc::new(commit));
     if let Err(e) = ctx
         .data_sender
@@ -227,13 +431,51 @@ fn new_market_fetch_condition_id(nm: &PolymarketNewMarket) -> Option<String> {
     None
 }
 
+fn snapshot_source_is_current(
+    ctx: &WsMessageContext,
+    instrument_id: InstrumentId,
+    source: BookSource,
+) -> bool {
+    if let Some(expected) = ctx.expected_book_sources.get(&instrument_id) {
+        return *expected == source;
+    }
+    ctx.ready_book_sources
+        .get(&instrument_id)
+        .is_none_or(|ready| *ready == source)
+}
+
+fn incremental_source_is_ready(
+    ctx: &WsMessageContext,
+    instrument_id: InstrumentId,
+    source: BookSource,
+) -> bool {
+    !ctx.pending_snapshot_after_tick_change
+        .contains(&instrument_id)
+        && (ctx
+            .ready_book_sources
+            .get(&instrument_id)
+            .is_some_and(|ready| *ready == source)
+            || source == LEGACY_BOOK_SOURCE && !ctx.ready_book_sources.contains_key(&instrument_id))
+}
+
 pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageContext) {
+    handle_ws_message_from_source(message, LEGACY_BOOK_SOURCE, ctx);
+}
+
+fn handle_ws_message_from_source(
+    message: PolymarketWsMessage,
+    source: BookSource,
+    ctx: &WsMessageContext,
+) {
     match message {
         PolymarketWsMessage::Market(market_msg) => {
-            handle_market_message(market_msg, ctx);
+            handle_market_message_from_source(market_msg, source, ctx);
         }
         PolymarketWsMessage::User(_) => {
             log::debug!("Ignoring user message on data client");
+        }
+        PolymarketWsMessage::ConnectionUnavailable | PolymarketWsMessage::MalformedMarketFrame => {
+            log::debug!("Ignoring pool-internal market lifecycle message");
         }
         PolymarketWsMessage::Reconnected => {
             log::info!("Polymarket WS reconnected");
@@ -253,7 +495,16 @@ pub(super) fn handle_ws_message(message: PolymarketWsMessage, ctx: &WsMessageCon
     }
 }
 
+#[cfg(test)]
 fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
+    handle_market_message_from_source(message, LEGACY_BOOK_SOURCE, ctx);
+}
+
+fn handle_market_message_from_source(
+    message: MarketWsMessage,
+    source: BookSource,
+    ctx: &WsMessageContext,
+) {
     match message {
         MarketWsMessage::Book(snap) => {
             let token_id = Ustr::from(snap.asset_id.as_str());
@@ -271,7 +522,14 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
             let mut staged_books = Vec::new();
             let mut ts_event = None;
 
-            if ctx.active_delta_subs.contains(&instrument_id) {
+            let active_delta = ctx.active_delta_subs.contains(&instrument_id);
+            let source_current = snapshot_source_is_current(ctx, instrument_id, source);
+            if active_delta && !source_current {
+                frame_valid = false;
+                log::debug!(
+                    "Dropping book snapshot for {instrument_id}: stale shard/generation source"
+                );
+            } else if active_delta {
                 match parse_book_snapshot(
                     &snap,
                     instrument_id,
@@ -342,25 +600,45 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
 
             let frame_emitted = if frame_valid {
                 ts_event.is_none_or(|ts_event| {
-                    emit_l2_frame(ctx, delta_batches, staged_books, ts_event, ts_init)
+                    let ready_instrument_id = [instrument_id];
+                    let ready_instrument_ids = if active_delta {
+                        ready_instrument_id.as_slice()
+                    } else {
+                        &[]
+                    };
+                    emit_l2_frame(
+                        ctx,
+                        source,
+                        delta_batches,
+                        staged_books,
+                        ready_instrument_ids,
+                        ts_event,
+                        ts_init,
+                    )
                 })
             } else {
                 false
             };
 
+            if !frame_valid && active_delta && source_current {
+                invalidate_book_source(
+                    ctx,
+                    instrument_id,
+                    source,
+                    PolymarketBookReadinessReason::MalformedFrame,
+                );
+            }
+
             if let Some(quote) = staged_quote {
                 emit_quote_if_changed(ctx, instrument_id, quote);
             }
 
-            if frame_emitted
-                && ts_event.is_some()
-                && ctx
-                    .pending_snapshot_after_tick_change
-                    .contains(&instrument_id)
-            {
+            if frame_emitted && ts_event.is_some() && active_delta {
                 ctx.pending_snapshot_after_tick_change
                     .remove(&instrument_id);
-                log::debug!("Resumed book for {instrument_id} after tick size change");
+                ctx.expected_book_sources.remove(&instrument_id);
+                ctx.ready_book_sources.insert(instrument_id, source);
+                log::debug!("Book ready for {instrument_id} on the current connection source");
             }
         }
 
@@ -370,6 +648,20 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                 Ok(ts) => ts,
                 Err(e) => {
                     log::error!("Failed to parse price change timestamp: {e}");
+                    for change in &quotes.price_changes {
+                        let token_id = Ustr::from(change.asset_id.as_str());
+                        if let Some(meta) = ctx.token_meta.get(&token_id).map(|meta| *meta)
+                            && ctx.active_delta_subs.contains(&meta.instrument_id)
+                            && incremental_source_is_ready(ctx, meta.instrument_id, source)
+                        {
+                            invalidate_book_source(
+                                ctx,
+                                meta.instrument_id,
+                                source,
+                                PolymarketBookReadinessReason::MalformedFrame,
+                            );
+                        }
+                    }
                     return;
                 }
             };
@@ -405,14 +697,12 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
             for (meta, changes) in &groups {
                 let instrument_id = meta.instrument_id;
                 let active = ctx.active_delta_subs.contains(&instrument_id);
-                let pending = ctx
-                    .pending_snapshot_after_tick_change
-                    .contains(&instrument_id);
+                let ready = incremental_source_is_ready(ctx, instrument_id, source);
 
-                if active && pending {
+                if active && !ready {
                     frame_valid = false;
                     log::debug!(
-                        "Dropping book deltas for {instrument_id}: awaiting snapshot after tick size change",
+                        "Dropping book deltas for {instrument_id}: source is not snapshot-ready",
                     );
                 }
 
@@ -439,7 +729,7 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                     }
                 }
 
-                if active && !pending && !parsed.is_empty() {
+                if active && ready && !parsed.is_empty() {
                     for delta in &mut parsed {
                         delta.flags &= !(RecordFlag::F_LAST as u8);
                     }
@@ -508,8 +798,30 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                 }
             }
 
-            let frame_emitted =
-                frame_valid && emit_l2_frame(ctx, delta_batches, staged_books, ts_event, ts_init);
+            let frame_emitted = frame_valid
+                && emit_l2_frame(
+                    ctx,
+                    source,
+                    delta_batches,
+                    staged_books,
+                    &[],
+                    ts_event,
+                    ts_init,
+                );
+            if !frame_valid {
+                for (meta, _) in &groups {
+                    if ctx.active_delta_subs.contains(&meta.instrument_id)
+                        && incremental_source_is_ready(ctx, meta.instrument_id, source)
+                    {
+                        invalidate_book_source(
+                            ctx,
+                            meta.instrument_id,
+                            source,
+                            PolymarketBookReadinessReason::MalformedFrame,
+                        );
+                    }
+                }
+            }
             if !frame_valid || frame_emitted {
                 for (instrument_id, quote) in staged_quotes {
                     emit_quote_if_changed(ctx, instrument_id, quote);
@@ -560,6 +872,15 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                     return;
                 }
             };
+            if ctx.active_delta_subs.contains(&meta.instrument_id)
+                && !snapshot_source_is_current(ctx, meta.instrument_id, source)
+            {
+                log::debug!(
+                    "Dropping tick-size change for {}: stale shard/generation source",
+                    meta.instrument_id,
+                );
+                return;
+            }
 
             let tick_size: rust_decimal::Decimal = match change.new_tick_size.parse() {
                 Ok(d) => d,
@@ -568,10 +889,19 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
                         "Failed to parse new tick size '{}': {e}",
                         change.new_tick_size
                     );
+                    if ctx.active_delta_subs.contains(&meta.instrument_id) {
+                        invalidate_book_source(
+                            ctx,
+                            meta.instrument_id,
+                            source,
+                            PolymarketBookReadinessReason::MalformedFrame,
+                        );
+                    }
                     return;
                 }
             };
             let new_price_precision = tick_size.scale() as u8;
+            let ts_init = ctx.clock.get_time_ns();
 
             let instruments = ctx.instruments.load();
             let existing = instruments.get(&meta.instrument_id);
@@ -605,8 +935,6 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
             );
 
             if let Some(existing) = existing {
-                let ts_init = ctx.clock.get_time_ns();
-
                 match rebuild_instrument_with_tick_size(
                     existing,
                     &change.new_tick_size,
@@ -631,6 +959,23 @@ fn handle_market_message(message: MarketWsMessage, ctx: &WsMessageContext) {
 
             if ctx.active_delta_subs.contains(&instrument_id) {
                 ctx.pending_snapshot_after_tick_change.insert(instrument_id);
+                ctx.ready_book_sources.remove(&instrument_id);
+                ctx.expected_book_sources.insert(instrument_id, source);
+                let Some(book_epoch) = advance_book_epoch(ctx, instrument_id) else {
+                    return;
+                };
+                emit_book_readiness(
+                    ctx,
+                    PolymarketBookReadiness::awaiting_snapshot(
+                        instrument_id,
+                        source.shard_id,
+                        source.connection_generation,
+                        book_epoch,
+                        PolymarketBookReadinessReason::TickSizeChanged,
+                        ts_init,
+                        ts_init,
+                    ),
+                );
             }
         }
 
@@ -936,8 +1281,9 @@ mod tests {
         },
         config::PolymarketDataClientConfig,
         data_types::{
-            POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketEventDefinitionSnapshot,
-            PolymarketFrameCommit,
+            POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketBookReadiness,
+            PolymarketBookReadinessReason, PolymarketBookReadinessState,
+            PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
         },
         http::data_api::PolymarketDataApiHttpClient,
         resolve::{
@@ -964,6 +1310,16 @@ mod tests {
             return None;
         };
         custom.data.as_any().downcast_ref::<PolymarketFrameCommit>()
+    }
+
+    fn book_readiness(event: &DataEvent) -> Option<&PolymarketBookReadiness> {
+        let DataEvent::Data(NautilusData::Custom(custom)) = event else {
+            return None;
+        };
+        custom
+            .data
+            .as_any()
+            .downcast_ref::<PolymarketBookReadiness>()
     }
 
     type CacheProbe = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -1126,6 +1482,11 @@ mod tests {
             resolve_poll_watchlist: Arc::new(AtomicMap::new()),
             resolve_watch_apply_mutex: Arc::new(StdMutex::new(())),
             pending_snapshot_after_tick_change: Arc::new(AtomicSet::new()),
+            expected_book_sources: Arc::new(DashMap::new()),
+            ready_book_sources: Arc::new(DashMap::new()),
+            book_epochs: Arc::new(DashMap::new()),
+            book_readiness_mutex: Arc::new(StdMutex::new(())),
+            market_data_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             new_market_inflight_keys: Arc::new(DashMap::new()),
             new_market_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 default_config.new_market_fetch_max_concurrency,
@@ -1264,6 +1625,11 @@ mod tests {
             resolve_poll_watchlist: client.resolve_poll_watchlist.clone(),
             resolve_watch_apply_mutex: client.resolve_watch_apply_mutex.clone(),
             pending_snapshot_after_tick_change: client.pending_snapshot_after_tick_change.clone(),
+            expected_book_sources: client.expected_book_sources.clone(),
+            ready_book_sources: client.ready_book_sources.clone(),
+            book_epochs: client.book_epochs.clone(),
+            book_readiness_mutex: client.book_readiness_mutex.clone(),
+            market_data_shutdown: client.market_data_shutdown.clone(),
             new_market_inflight_keys: client.new_market_inflight_keys.clone(),
             new_market_fetch_semaphore: client.new_market_fetch_semaphore.clone(),
             rtds_feed: client.rtds_feed.clone(),
@@ -3600,9 +3966,59 @@ mod tests {
             events.iter().any(|e| matches!(e, DataEvent::Instrument(_))),
             "expected rebuilt instrument event, found: {events:?}",
         );
+        let readiness = events
+            .iter()
+            .find_map(book_readiness)
+            .expect("tick size change readiness");
+        assert_eq!(
+            readiness.state(),
+            PolymarketBookReadinessState::AwaitingSnapshot
+        );
+        assert_eq!(
+            readiness.reason(),
+            PolymarketBookReadinessReason::TickSizeChanged
+        );
+    }
+
+    #[rstest]
+    fn malformed_tick_size_change_revokes_ready_book() {
+        let asset_id = "0xBADTICK";
+        let market = "0xMARKET";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot(market, asset_id, &[("0.49", "10"), ("0.51", "10")]),
+            &ctx,
+        );
+        assert!(ctx.order_books.contains_key(&instrument_id));
+        while data_rx.try_recv().is_ok() {}
+
+        handle_market_message(
+            make_tick_change(market, asset_id, "0.01", "not-a-decimal"),
+            &ctx,
+        );
+
+        assert!(!ctx.order_books.contains_key(&instrument_id));
         assert!(
-            !events.iter().any(|e| matches!(e, DataEvent::Data(_))),
-            "tick size change must not emit Data events: {events:?}",
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        assert!(!ctx.ready_book_sources.contains_key(&instrument_id));
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        let readiness = events
+            .iter()
+            .find_map(book_readiness)
+            .expect("malformed tick invalidation");
+        assert_eq!(
+            readiness.state(),
+            PolymarketBookReadinessState::AwaitingSnapshot
+        );
+        assert_eq!(
+            readiness.reason(),
+            PolymarketBookReadinessReason::MalformedFrame
         );
     }
 
@@ -3825,14 +4241,153 @@ mod tests {
         );
 
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 3);
         assert!(matches!(
             events[0],
             DataEvent::Data(NautilusData::Deltas(_))
         ));
-        let commit = frame_commit(&events[1]).expect("frame commit after snapshot deltas");
+        let readiness = book_readiness(&events[1]).expect("readiness after snapshot deltas");
+        assert_eq!(readiness.state(), PolymarketBookReadinessState::Ready);
+        let commit = frame_commit(&events[2]).expect("frame commit after snapshot readiness");
         assert_eq!(commit.frame_id(), 1);
         assert_eq!(commit.affected_instrument_ids(), &[instrument_id]);
+    }
+
+    #[rstest]
+    fn connection_epoch_boundary_invalidates_only_its_assigned_books() {
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_a = seed_instrument(
+            &ctx,
+            "0xTOKEN-EPOCH-A",
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        )
+        .id();
+        let instrument_b = seed_instrument(
+            &ctx,
+            "0xTOKEN-EPOCH-B",
+            Price::from("0.01"),
+            Quantity::from("0.01"),
+        )
+        .id();
+        let prior_source = BookSource {
+            shard_id: 4,
+            connection_generation: 1,
+        };
+        for instrument_id in [instrument_a, instrument_b] {
+            ctx.active_delta_subs.insert(instrument_id);
+            ctx.book_epochs.insert(instrument_id, 1);
+            ctx.ready_book_sources.insert(instrument_id, prior_source);
+            ctx.order_books.insert(
+                instrument_id,
+                OrderBook::new(instrument_id, BookType::L2_MBP),
+            );
+        }
+
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+                shard_id: 4,
+                connection_generation: 2,
+                assigned_asset_ids: vec![Ustr::from("0xTOKEN-EPOCH-A")],
+            },
+            &ctx,
+        );
+
+        assert!(!ctx.order_books.contains_key(&instrument_a));
+        assert!(ctx.order_books.contains_key(&instrument_b));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_a)
+        );
+        assert!(
+            !ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_b)
+        );
+        assert_eq!(*ctx.book_epochs.get(&instrument_a).expect("epoch A"), 2);
+        assert_eq!(*ctx.book_epochs.get(&instrument_b).expect("epoch B"), 1);
+        assert_eq!(
+            *ctx.expected_book_sources
+                .get(&instrument_a)
+                .expect("source A"),
+            BookSource {
+                shard_id: 4,
+                connection_generation: 2,
+            }
+        );
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        let readiness = events
+            .iter()
+            .find_map(book_readiness)
+            .expect("pending readiness");
+        assert_eq!(readiness.instrument_id(), instrument_a);
+        assert_eq!(readiness.book_epoch(), 2);
+        assert_eq!(
+            readiness.state(),
+            PolymarketBookReadinessState::AwaitingSnapshot
+        );
+    }
+
+    #[rstest]
+    fn stale_connection_incremental_is_rejected_before_book_or_commit() {
+        let asset_id = "0xTOKEN-STALE-EPOCH";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.book_epochs.insert(instrument_id, 2);
+        ctx.ready_book_sources.insert(
+            instrument_id,
+            BookSource {
+                shard_id: 2,
+                connection_generation: 2,
+            },
+        );
+        ctx.order_books.insert(
+            instrument_id,
+            OrderBook::new(instrument_id, BookType::L2_MBP),
+        );
+
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::Message {
+                shard_id: 2,
+                connection_generation: 1,
+                message: PolymarketWsMessage::Market(make_price_change(
+                    "0xMARKET", asset_id, "0.50", "20",
+                )),
+            },
+            &ctx,
+        );
+
+        assert!(data_rx.try_recv().is_err());
+        assert_eq!(ctx.frame_counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[rstest]
+    fn shutdown_gate_suppresses_queued_snapshot_publication() {
+        let asset_id = "0xTOKEN-SHUTDOWN";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+        ctx.market_data_shutdown.store(true, Ordering::Release);
+
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::Message {
+                shard_id: 3,
+                connection_generation: 7,
+                message: PolymarketWsMessage::Market(make_snapshot(
+                    "0xMARKET",
+                    asset_id,
+                    &[("0.49", "10"), ("0.51", "10")],
+                )),
+            },
+            &ctx,
+        );
+
+        assert!(data_rx.try_recv().is_err());
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        assert!(!ctx.ready_book_sources.contains_key(&instrument_id));
+        assert_eq!(ctx.frame_counter.load(Ordering::Relaxed), 0);
     }
 
     #[rstest]
@@ -3947,6 +4502,8 @@ mod tests {
         );
 
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        let book_a = ctx.order_books.get(&instrument_a).expect("book A");
+        let book_b = ctx.order_books.get(&instrument_b).expect("book B");
         let batches: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -3961,9 +4518,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let book_a = ctx.order_books.get(&instrument_a).expect("book A");
-        let book_b = ctx.order_books.get(&instrument_b).expect("book B");
-
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].instrument_id, instrument_a);
         assert_eq!(batches[0].deltas.len(), 3);
@@ -4065,9 +4619,6 @@ mod tests {
         );
 
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
-        let book_a = ctx.order_books.get(&instrument_a).expect("book A");
-        let book_b = ctx.order_books.get(&instrument_b).expect("book B");
-
         assert!(
             !events
                 .iter()
@@ -4078,12 +4629,17 @@ mod tests {
             !events.iter().any(|event| frame_commit(event).is_some()),
             "invalid frame must not emit a commit: {events:?}",
         );
-        assert_eq!(book_a.best_bid_price(), Some(Price::from("0.003")));
-        assert_eq!(book_b.best_bid_price(), Some(Price::from("0.993")));
+        assert!(!ctx.order_books.contains_key(&instrument_a));
+        assert!(!ctx.order_books.contains_key(&instrument_b));
         assert!(
-            !ctx.pending_snapshot_after_tick_change
+            ctx.pending_snapshot_after_tick_change
                 .contains(&instrument_a)
         );
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_b)
+        );
+        assert_eq!(events.iter().filter_map(book_readiness).count(), 2);
     }
 
     #[rstest]
@@ -4255,9 +4811,14 @@ mod tests {
                 .contains(&instrument_id)
         );
         let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
-        assert!(
-            !events.iter().any(|e| matches!(e, DataEvent::Data(_))),
-            "empty snapshot must not emit Data events: {events:?}",
+        let readiness = events
+            .iter()
+            .find_map(book_readiness)
+            .expect("malformed snapshot invalidation");
+        assert_eq!(
+            readiness.reason(),
+            PolymarketBookReadinessReason::MalformedFrame
         );
+        assert!(!ctx.order_books.contains_key(&instrument_id));
     }
 }

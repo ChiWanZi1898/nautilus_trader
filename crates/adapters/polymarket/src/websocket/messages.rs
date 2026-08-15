@@ -500,6 +500,10 @@ struct UserWsTag {
 pub enum PolymarketWsMessage {
     Market(MarketWsMessage),
     User(UserWsMessage),
+    /// The managed transport entered reconnect mode before a replacement connection was ready.
+    ConnectionUnavailable,
+    /// A market text frame failed strict all-or-none parsing.
+    MalformedMarketFrame,
     /// Emitted when the underlying WebSocket reconnects.
     Reconnected,
 }

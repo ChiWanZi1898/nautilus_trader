@@ -354,6 +354,16 @@ impl PolymarketExecutionClient {
                         }
                     }
                     Some(PolymarketWsMessage::Market(_)) => {}
+                    Some(
+                        PolymarketWsMessage::ConnectionUnavailable
+                        | PolymarketWsMessage::MalformedMarketFrame,
+                    ) => {
+                        log::error!("Unexpected market lifecycle message on user WebSocket");
+                        heartbeat_healthy.store(false, Ordering::Release);
+                        user_stream_healthy.store(false, Ordering::Release);
+                        stopping.store(true, Ordering::Release);
+                        break;
+                    }
                     Some(PolymarketWsMessage::Reconnected) => {
                         log::info!("User WebSocket reconnected");
                         if stopping.load(Ordering::Acquire) {

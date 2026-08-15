@@ -15,8 +15,9 @@
 
 use nautilus_model::data::custom::CustomDataTrait;
 use nautilus_polymarket::data_types::{
-    POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, POLYMARKET_FRAME_COMMIT_TYPE_NAME,
-    PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
+    POLYMARKET_BOOK_READINESS_TYPE_NAME, POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME,
+    POLYMARKET_FRAME_COMMIT_TYPE_NAME, PolymarketBookReadiness, PolymarketBookReadinessReason,
+    PolymarketBookReadinessState, PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
 };
 
 #[test]
@@ -28,6 +29,48 @@ fn frame_commit_is_a_public_typed_custom_data_contract() {
         <PolymarketFrameCommit as CustomDataTrait>::type_name_static(),
         POLYMARKET_FRAME_COMMIT_TYPE_NAME,
     );
+}
+
+#[test]
+fn book_readiness_is_a_validated_public_typed_custom_data_contract() {
+    fn assert_custom_data<T: CustomDataTrait>() {}
+
+    assert_custom_data::<PolymarketBookReadiness>();
+    assert_eq!(
+        <PolymarketBookReadiness as CustomDataTrait>::type_name_static(),
+        POLYMARKET_BOOK_READINESS_TYPE_NAME,
+    );
+
+    let value = serde_json::json!({
+        "instrument_id": "0xTOKEN.POLYMARKET",
+        "shard_id": 3,
+        "connection_generation": 7,
+        "book_epoch": 9,
+        "state": "READY",
+        "reason": "SNAPSHOT_ACCEPTED",
+        "snapshot_frame_id": 11,
+        "ts_event": 42,
+        "ts_init": 43
+    });
+    let restored = <PolymarketBookReadiness as CustomDataTrait>::from_json(value.clone())
+        .expect("validated readiness");
+    let readiness = restored
+        .as_any()
+        .downcast_ref::<PolymarketBookReadiness>()
+        .expect("public downcast");
+    assert_eq!(readiness.shard_id(), 3);
+    assert_eq!(readiness.connection_generation(), 7);
+    assert_eq!(readiness.book_epoch(), 9);
+    assert_eq!(readiness.state(), PolymarketBookReadinessState::Ready);
+    assert_eq!(
+        readiness.reason(),
+        PolymarketBookReadinessReason::SnapshotAccepted
+    );
+    assert_eq!(readiness.snapshot_frame_id(), Some(11));
+
+    let mut invalid = value;
+    invalid["snapshot_frame_id"] = serde_json::Value::Null;
+    assert!(<PolymarketBookReadiness as CustomDataTrait>::from_json(invalid).is_err());
 }
 
 #[test]

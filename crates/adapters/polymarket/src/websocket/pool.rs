@@ -123,6 +123,18 @@ pub(crate) enum PolymarketMarketPoolEvent {
         connection_generation: u64,
         assigned_asset_ids: Vec<Ustr>,
     },
+    SourceInvalidated {
+        shard_id: u64,
+        connection_generation: u64,
+        assigned_asset_ids: Vec<Ustr>,
+        reason: PolymarketMarketSourceInvalidation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PolymarketMarketSourceInvalidation {
+    ConnectionUnavailable,
+    MalformedFrame,
 }
 
 #[allow(
@@ -664,8 +676,48 @@ impl PoolInner {
                 }
                 last_transport_epoch = Some(transport_epoch);
 
-                if matches!(connection_message.message, PolymarketWsMessage::Reconnected) {
-                    continue;
+                match &connection_message.message {
+                    PolymarketWsMessage::Reconnected => continue,
+                    PolymarketWsMessage::ConnectionUnavailable
+                    | PolymarketWsMessage::MalformedMarketFrame => {
+                        let reason = match &connection_message.message {
+                            PolymarketWsMessage::ConnectionUnavailable => {
+                                PolymarketMarketSourceInvalidation::ConnectionUnavailable
+                            }
+                            PolymarketWsMessage::MalformedMarketFrame => {
+                                PolymarketMarketSourceInvalidation::MalformedFrame
+                            }
+                            _ => unreachable!("matched lifecycle fault"),
+                        };
+                        let Some(inner) = inner.upgrade() else {
+                            break;
+                        };
+                        let shard_index = usize::try_from(shard_id).expect("shard id fits");
+                        let mut assigned_asset_ids = inner
+                            .state
+                            .lock()
+                            .expect("pool state mutex poisoned")
+                            .assignments
+                            .iter()
+                            .filter_map(|(asset_id, assigned_shard)| {
+                                (*assigned_shard == shard_index).then_some(*asset_id)
+                            })
+                            .collect::<Vec<_>>();
+                        assigned_asset_ids.sort_unstable();
+                        if out_tx
+                            .send(PolymarketMarketPoolEvent::SourceInvalidated {
+                                shard_id,
+                                connection_generation,
+                                assigned_asset_ids,
+                                reason,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    PolymarketWsMessage::Market(_) | PolymarketWsMessage::User(_) => {}
                 }
 
                 if out_tx
@@ -930,6 +982,60 @@ mod tests {
             out_rx.try_recv().is_err(),
             "marker must not duplicate boundary"
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn malformed_frame_invalidates_the_entire_assigned_shard() {
+        let inner = Arc::new(PoolInner::new(
+            None,
+            TransportBackend::default(),
+            false,
+            WS_DEFAULT_SUBSCRIPTIONS,
+        ));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        *inner.out_tx.lock().expect("pool out_tx mutex poisoned") = Some(out_tx);
+        {
+            let mut state = inner.state.lock().expect("pool state mutex poisoned");
+            state.assignments.insert(Ustr::from("token-b"), 4);
+            state.assignments.insert(Ustr::from("token-a"), 4);
+        }
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = inner.spawn_forwarder(4, raw_rx);
+        raw_tx
+            .send(PolymarketConnectionMessage {
+                transport_epoch: 2,
+                message: PolymarketWsMessage::MalformedMarketFrame,
+            })
+            .expect("malformed marker");
+        drop(raw_tx);
+
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+                shard_id: 4,
+                connection_generation: 3,
+                ..
+            })
+        ));
+        match out_rx.recv().await.expect("source invalidation") {
+            PolymarketMarketPoolEvent::SourceInvalidated {
+                shard_id,
+                connection_generation,
+                assigned_asset_ids,
+                reason,
+            } => {
+                assert_eq!(shard_id, 4);
+                assert_eq!(connection_generation, 3);
+                assert_eq!(
+                    assigned_asset_ids,
+                    [Ustr::from("token-a"), Ustr::from("token-b")]
+                );
+                assert_eq!(reason, PolymarketMarketSourceInvalidation::MalformedFrame);
+            }
+            other => panic!("unexpected pool event: {other:?}"),
+        }
+        forwarder.await.expect("forwarder exits");
     }
 
     #[rstest]
