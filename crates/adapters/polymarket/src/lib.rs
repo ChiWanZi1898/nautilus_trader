@@ -49,6 +49,7 @@ pub mod common;
 pub mod config;
 pub mod data;
 pub mod data_types;
+pub mod evidence;
 pub mod execution;
 pub mod factories;
 pub mod filters;

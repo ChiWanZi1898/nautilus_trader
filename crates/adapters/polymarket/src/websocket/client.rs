@@ -17,7 +17,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 
 use nautilus_common::live::get_runtime;
@@ -33,9 +33,12 @@ use super::{
     handler::{FeedHandler, HandlerCommand},
     messages::PolymarketWsMessage,
 };
-use crate::common::{
-    credential::Credential,
-    urls::{clob_ws_market_url, clob_ws_user_url},
+use crate::{
+    common::{
+        credential::Credential,
+        urls::{clob_ws_market_url, clob_ws_user_url},
+    },
+    evidence::PolymarketEvidenceBridge,
 };
 
 const POLYMARKET_HEARTBEAT_SECS: u64 = 30;
@@ -118,6 +121,8 @@ pub struct PolymarketWebSocketClient {
     subscribe_new_markets: bool,
     transport_backend: TransportBackend,
     proxy_url: Option<ProxyUrl>,
+    evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+    user_session_epoch: Arc<AtomicU64>,
 }
 
 impl PolymarketWebSocketClient {
@@ -149,6 +154,7 @@ impl PolymarketWebSocketClient {
             subscribe_new_markets,
             transport_backend,
             proxy_url,
+            None,
         )
     }
 
@@ -180,6 +186,26 @@ impl PolymarketWebSocketClient {
             false,
             transport_backend,
             proxy_url,
+            None,
+        )
+    }
+
+    pub(crate) fn new_user_with_proxy_and_evidence(
+        base_url: Option<String>,
+        credential: Credential,
+        transport_backend: TransportBackend,
+        proxy_url: Option<ProxyUrl>,
+        evidence_bridge: Arc<dyn PolymarketEvidenceBridge>,
+    ) -> Self {
+        let url = base_url.unwrap_or_else(|| clob_ws_user_url().to_string());
+        Self::new_inner(
+            WsChannel::User,
+            url,
+            Some(credential),
+            false,
+            transport_backend,
+            proxy_url,
+            Some(evidence_bridge),
         )
     }
 
@@ -190,6 +216,7 @@ impl PolymarketWebSocketClient {
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
         proxy_url: Option<ProxyUrl>,
+        evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
     ) -> Self {
         let (placeholder_tx, _) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -207,6 +234,8 @@ impl PolymarketWebSocketClient {
             subscribe_new_markets,
             transport_backend,
             proxy_url,
+            evidence_bridge,
+            user_session_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -280,6 +309,18 @@ impl PolymarketWebSocketClient {
         let auth_tracker = self.auth_tracker.clone();
         let user_subscribed = self.user_subscribed.load(Ordering::Relaxed);
         let subscribe_new_markets = self.subscribe_new_markets;
+        let evidence_bridge = self.evidence_bridge.clone();
+        let user_session_epoch = self.user_session_epoch.clone();
+        let session_epoch = if channel == WsChannel::User {
+            user_session_epoch
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+                .map_err(|_| anyhow::anyhow!("Polymarket user session epoch overflow"))?
+                + 1
+        } else {
+            0
+        };
 
         let stream_handle = get_runtime().spawn(async move {
             let mut handler = FeedHandler::new(
@@ -293,6 +334,9 @@ impl PolymarketWebSocketClient {
                 auth_tracker,
                 user_subscribed,
                 subscribe_new_markets,
+                evidence_bridge,
+                user_session_epoch,
+                session_epoch,
             );
 
             loop {

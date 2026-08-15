@@ -28,6 +28,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Bytes,
@@ -85,6 +86,10 @@ use nautilus_polymarket::{
         enums::{PolymarketBuilderAttribution, SignatureType},
     },
     config::PolymarketExecClientConfig,
+    evidence::{
+        PolymarketAuthenticatedUserFrame, PolymarketEvidenceAck, PolymarketEvidenceBridge,
+        PolymarketEvidenceError, PolymarketMutationEvidence,
+    },
     execution::PolymarketExecutionClient,
     http::models::PolymarketOrder,
     signing::eip712::order_hash,
@@ -298,6 +303,62 @@ fn load_json(filename: &str) -> Value {
     serde_json::from_str(&content).expect("invalid json")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedEvidenceKind {
+    Prepared,
+    Handoff,
+}
+
+#[derive(Debug, Default)]
+struct TestEvidenceBridge {
+    observed: tokio::sync::Mutex<Vec<(ObservedEvidenceKind, [u8; 32], usize)>>,
+    fail_on_append: AtomicUsize,
+}
+
+impl TestEvidenceBridge {
+    fn fail_on(&self, append_number: usize) {
+        self.fail_on_append.store(append_number, Ordering::SeqCst);
+    }
+
+    async fn observed(&self) -> Vec<(ObservedEvidenceKind, [u8; 32], usize)> {
+        self.observed.lock().await.clone()
+    }
+}
+
+#[async_trait]
+impl PolymarketEvidenceBridge for TestEvidenceBridge {
+    async fn append_mutation(
+        &self,
+        fact: &PolymarketMutationEvidence<'_>,
+    ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+        let (kind, leg_count) = match fact {
+            PolymarketMutationEvidence::SubmitPrepared(prepared) => {
+                (ObservedEvidenceKind::Prepared, prepared.legs().len())
+            }
+            PolymarketMutationEvidence::HandoffStarted(_) => (ObservedEvidenceKind::Handoff, 0),
+        };
+        let mut observed = self.observed.lock().await;
+        let append_number = observed.len() + 1;
+        if self.fail_on_append.load(Ordering::SeqCst) == append_number {
+            return Err(PolymarketEvidenceError::Durability);
+        }
+        let fact_id = *fact.fact_id();
+        observed.push((kind, fact_id, leg_count));
+        PolymarketEvidenceAck::try_new(
+            fact_id,
+            u64::try_from(append_number)
+                .map_err(|_| PolymarketEvidenceError::InvalidAcknowledgement)?,
+        )
+    }
+
+    async fn append_authenticated_user_frame(
+        &self,
+        fact: &PolymarketAuthenticatedUserFrame,
+    ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+        PolymarketEvidenceAck::try_new(*fact.fact_id(), 1)
+    }
+}
+
 fn create_test_exec_config(addr: SocketAddr) -> PolymarketExecClientConfig {
     create_test_exec_config_with_retries(addr, 0)
 }
@@ -355,6 +416,17 @@ fn create_test_execution_client_from_config(
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     Rc<RefCell<Cache>>,
 ) {
+    create_test_execution_client_from_config_and_bridge(config, None)
+}
+
+fn create_test_execution_client_from_config_and_bridge(
+    config: PolymarketExecClientConfig,
+    bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+) -> (
+    PolymarketExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
     let trader_id = TraderId::from("TESTER-001");
     let account_id = AccountId::from("POLYMARKET-001");
     let client_id = *POLYMARKET_CLIENT_ID;
@@ -375,7 +447,11 @@ fn create_test_execution_client_from_config(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     set_exec_event_sender(tx);
 
-    let client = PolymarketExecutionClient::new(core, config).unwrap();
+    let client = if let Some(bridge) = bridge {
+        PolymarketExecutionClient::new_with_evidence_bridge(core, config, bridge).unwrap()
+    } else {
+        PolymarketExecutionClient::new(core, config).unwrap()
+    };
 
     (client, rx, cache)
 }
@@ -4280,6 +4356,159 @@ async fn test_none_builder_attribution_signs_single_order_with_zero_builder() {
         serde_json::from_value(body.get("order").unwrap().clone()).unwrap();
     assert_eq!(signed_order.builder, POLYMARKET_ZERO_BUILDER_CODE);
     assert!(order_hash(&signed_order, false).is_ok());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_durable_bridge_records_prepared_then_handoff_before_single_post() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.pre_activate_expected_order_ids = true;
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let bridge = Arc::new(TestEvidenceBridge::default());
+    let (mut client, _rx, cache) =
+        create_test_execution_client_from_config_and_bridge(config, Some(bridge.clone()));
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-DURABLE-SINGLE",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let observed = bridge.observed().await;
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].0, ObservedEvidenceKind::Prepared);
+    assert_eq!(observed[0].2, 1);
+    assert_eq!(observed[1].0, ObservedEvidenceKind::Handoff);
+    assert_eq!(observed[0].1, observed[1].1);
+}
+
+#[rstest]
+#[case(1)]
+#[case(2)]
+#[tokio::test]
+async fn test_durable_bridge_failure_before_handoff_sends_zero_http(#[case] fail_on: usize) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.pre_activate_expected_order_ids = true;
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let bridge = Arc::new(TestEvidenceBridge::default());
+    bridge.fail_on(fail_on);
+    let (mut client, mut rx, cache) =
+        create_test_execution_client_from_config_and_bridge(config, Some(bridge.clone()));
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        &format!("O-DURABLE-FAIL-{fail_on}"),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(bridge.observed().await.len(), fail_on.saturating_sub(1));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_durable_bridge_commits_one_ordered_prepare_all_group() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.pre_activate_expected_order_ids = true;
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let bridge = Arc::new(TestEvidenceBridge::default());
+    let (mut client, _rx, cache) =
+        create_test_execution_client_from_config_and_bridge(config, Some(bridge.clone()));
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let orders = [
+        make_limit_order(
+            "O-DURABLE-BATCH-1",
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+        make_limit_order(
+            "O-DURABLE-BATCH-2",
+            instrument_id,
+            OrderSide::Sell,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+    ];
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+    client
+        .submit_order_list(make_submit_order_list_cmd_with_params(
+            instrument_id,
+            &orders,
+            Some(prepare_all_or_none_params(true)),
+        ))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.batch_order_post_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let observed = bridge.observed().await;
+    assert_eq!(observed.len(), 2);
+    assert_eq!(observed[0].0, ObservedEvidenceKind::Prepared);
+    assert_eq!(observed[0].2, 2);
+    assert_eq!(observed[1].0, ObservedEvidenceKind::Handoff);
+    assert_eq!(observed[0].1, observed[1].1);
 }
 
 #[rstest]

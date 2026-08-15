@@ -69,6 +69,24 @@ pub(crate) struct SignedLimitOrderSubmission {
     pub(crate) expected_venue_order_id: VenueOrderId,
 }
 
+impl SignedLimitOrderSubmission {
+    pub(crate) const fn order(&self) -> &PolymarketOrder {
+        &self.order
+    }
+
+    pub(crate) const fn order_type(&self) -> PolymarketOrderType {
+        self.order_type
+    }
+
+    pub(crate) const fn post_only(&self) -> bool {
+        self.post_only
+    }
+
+    pub(crate) const fn expected_venue_order_id(&self) -> VenueOrderId {
+        self.expected_venue_order_id
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LimitHttpRequestEndpoint {
     Single,

@@ -17,7 +17,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use nautilus_network::{
@@ -36,7 +36,10 @@ use super::{
         UserWsMessage,
     },
 };
-use crate::common::credential::Credential;
+use crate::{
+    common::credential::Credential,
+    evidence::{PolymarketAuthenticatedUserFrame, PolymarketEvidenceBridge},
+};
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
@@ -71,6 +74,10 @@ pub(super) struct FeedHandler {
     message_buffer: Vec<PolymarketWsMessage>,
     // Whether to include `custom_feature_enabled: true` in the initial subscribe
     subscribe_new_markets: bool,
+    evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+    user_session_epoch_counter: Arc<AtomicU64>,
+    user_session_epoch: u64,
+    user_frame_sequence: u64,
 }
 
 impl FeedHandler {
@@ -86,6 +93,9 @@ impl FeedHandler {
         auth_tracker: AuthTracker,
         user_subscribed: bool,
         subscribe_new_markets: bool,
+        evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+        user_session_epoch_counter: Arc<AtomicU64>,
+        user_session_epoch: u64,
     ) -> Self {
         Self {
             signal,
@@ -101,6 +111,10 @@ impl FeedHandler {
             market_subscription_initialized: false,
             message_buffer: Vec::new(),
             subscribe_new_markets,
+            evidence_bridge,
+            user_session_epoch_counter,
+            user_session_epoch,
+            user_frame_sequence: 1,
         }
     }
 
@@ -330,6 +344,20 @@ impl FeedHandler {
                     match raw {
                         Message::Text(text) => {
                             if text == RECONNECTED {
+                                if self.channel == WsChannel::User {
+                                    let next_epoch = self.user_session_epoch_counter.fetch_update(
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                        |current| current.checked_add(1),
+                                    );
+                                    let Ok(previous_epoch) = next_epoch else {
+                                        log::error!("Polymarket user session epoch overflow");
+                                        self.signal.store(true, Ordering::SeqCst);
+                                        return None;
+                                    };
+                                    self.user_session_epoch = previous_epoch + 1;
+                                    self.user_frame_sequence = 1;
+                                }
                                 self.market_subscription_initialized = false;
                                 self.resubscribe_all().await;
                                 return Some(PolymarketWsMessage::Reconnected);
@@ -337,6 +365,59 @@ impl FeedHandler {
                             let msgs = self.parse_messages(&text);
                             if msgs.is_empty() {
                                 continue;
+                            }
+                            if self.channel == WsChannel::User
+                                && let Some(bridge) = &self.evidence_bridge
+                            {
+                                let fact = match PolymarketAuthenticatedUserFrame::try_new(
+                                    self.user_session_epoch,
+                                    self.user_frame_sequence,
+                                    text.as_bytes(),
+                                ) {
+                                    Ok(fact) => fact,
+                                    Err(error) => {
+                                        log::error!("Authenticated user evidence invalid: {error}");
+                                        self.auth_tracker.fail(error.to_string());
+                                        if let Some(client) = &self.client {
+                                            client.disconnect().await;
+                                        }
+                                        self.signal.store(true, Ordering::SeqCst);
+                                        return None;
+                                    }
+                                };
+                                match bridge.append_authenticated_user_frame(&fact).await {
+                                    Ok(ack) if ack.fact_id() == fact.fact_id() => {
+                                        let Some(next_sequence) =
+                                            self.user_frame_sequence.checked_add(1)
+                                        else {
+                                            log::error!("Polymarket user frame sequence overflow");
+                                            self.signal.store(true, Ordering::SeqCst);
+                                            return None;
+                                        };
+                                        self.user_frame_sequence = next_sequence;
+                                    }
+                                    Ok(_) => {
+                                        log::error!("Authenticated user evidence acknowledgement mismatch");
+                                        self.auth_tracker.fail(
+                                            "authenticated user evidence acknowledgement mismatch"
+                                                .to_string(),
+                                        );
+                                        if let Some(client) = &self.client {
+                                            client.disconnect().await;
+                                        }
+                                        self.signal.store(true, Ordering::SeqCst);
+                                        return None;
+                                    }
+                                    Err(error) => {
+                                        log::error!("Authenticated user evidence failed: {error}");
+                                        self.auth_tracker.fail(error.to_string());
+                                        if let Some(client) = &self.client {
+                                            client.disconnect().await;
+                                        }
+                                        self.signal.store(true, Ordering::SeqCst);
+                                        return None;
+                                    }
+                                }
                             }
                             // Receiving any user-channel data confirms the server accepted the
                             // credentials; mark auth as successful on the first delivery.
@@ -372,10 +453,41 @@ impl FeedHandler {
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use rstest::{fixture, rstest};
 
     use super::*;
-    use crate::common::enums::PolymarketOrderSide;
+    use crate::{
+        common::enums::PolymarketOrderSide,
+        evidence::{PolymarketEvidenceAck, PolymarketEvidenceError, PolymarketMutationEvidence},
+    };
+
+    #[derive(Debug, Default)]
+    struct TestFrameBridge {
+        frames: tokio::sync::Mutex<Vec<Vec<u8>>>,
+        fail: AtomicBool,
+    }
+
+    #[async_trait]
+    impl PolymarketEvidenceBridge for TestFrameBridge {
+        async fn append_mutation(
+            &self,
+            _fact: &PolymarketMutationEvidence<'_>,
+        ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+            Err(PolymarketEvidenceError::Unavailable)
+        }
+
+        async fn append_authenticated_user_frame(
+            &self,
+            fact: &PolymarketAuthenticatedUserFrame,
+        ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(PolymarketEvidenceError::Durability);
+            }
+            self.frames.lock().await.push(fact.raw_utf8().to_vec());
+            PolymarketEvidenceAck::try_new(*fact.fact_id(), fact.frame_sequence())
+        }
+    }
 
     #[fixture]
     fn market_handler() -> FeedHandler {
@@ -403,7 +515,77 @@ mod tests {
             AuthTracker::new(),
             false,
             false,
+            None,
+            Arc::new(AtomicU64::new(u64::from(channel == WsChannel::User))),
+            u64::from(channel == WsChannel::User),
         )
+    }
+
+    fn user_handler_with_bridge(
+        bridge: Arc<TestFrameBridge>,
+    ) -> (FeedHandler, UnboundedSender<Message>) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            FeedHandler::new(
+                Arc::new(AtomicBool::new(false)),
+                WsChannel::User,
+                cmd_rx,
+                raw_rx,
+                out_tx,
+                None,
+                SubscriptionState::new(':'),
+                AuthTracker::new(),
+                false,
+                false,
+                Some(bridge),
+                Arc::new(AtomicU64::new(1)),
+                1,
+            ),
+            raw_tx,
+        )
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticated_batch_is_durable_once_before_any_element_is_released() {
+        let bridge = Arc::new(TestFrameBridge::default());
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
+        let raw = include_str!("../../test_data/ws_user_batch_msg.json");
+        raw_tx
+            .send(Message::Text(raw.to_string().into()))
+            .expect("send raw frame");
+
+        assert!(matches!(
+            handler.next().await,
+            Some(PolymarketWsMessage::User(_))
+        ));
+        assert_eq!(bridge.frames.lock().await.as_slice(), &[raw.as_bytes()]);
+        assert!(matches!(
+            handler.next().await,
+            Some(PolymarketWsMessage::User(_))
+        ));
+        assert_eq!(bridge.frames.lock().await.len(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn durability_failure_releases_no_authenticated_element() {
+        let bridge = Arc::new(TestFrameBridge::default());
+        bridge.fail.store(true, Ordering::SeqCst);
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge);
+        raw_tx
+            .send(Message::Text(
+                include_str!("../../test_data/ws_user_batch_msg.json")
+                    .to_string()
+                    .into(),
+            ))
+            .expect("send raw frame");
+
+        assert!(handler.next().await.is_none());
+        assert!(handler.is_stopped());
+        assert!(handler.message_buffer.is_empty());
     }
 
     #[rstest]

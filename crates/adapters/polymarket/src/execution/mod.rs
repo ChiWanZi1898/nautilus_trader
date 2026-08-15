@@ -78,8 +78,13 @@ use self::{
     submitter::OrderSubmitter,
 };
 use crate::{
-    common::{consts::POLYMARKET_VENUE, credential::Secrets, enums::SignatureType},
+    common::{
+        consts::POLYMARKET_VENUE,
+        credential::Secrets,
+        enums::{PolymarketBuilderAttribution, SignatureType},
+    },
     config::PolymarketExecClientConfig,
+    evidence::PolymarketEvidenceBridge,
     http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
     signing::eip712::OrderSigner,
     websocket::{client::PolymarketWebSocketClient, dispatch::WsDispatchState},
@@ -111,6 +116,7 @@ pub struct PolymarketExecutionClient {
     order_identities: Arc<OrderIdentityRegistry>,
     fill_tracker: Arc<OrderFillTrackerMap>,
     ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
+    evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
 }
 
 impl PolymarketExecutionClient {
@@ -122,6 +128,37 @@ impl PolymarketExecutionClient {
     pub fn new(
         core: ExecutionClientCore,
         config: PolymarketExecClientConfig,
+    ) -> anyhow::Result<Self> {
+        Self::new_inner(core, config, None)
+    }
+
+    /// Creates a client whose signed LIMIT mutations require application-owned
+    /// durable evidence before identity activation and HTTP handoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if expected signed identity pre-activation is not
+    /// enabled, credentials cannot be resolved, or clients fail to construct.
+    pub fn new_with_evidence_bridge(
+        core: ExecutionClientCore,
+        config: PolymarketExecClientConfig,
+        evidence_bridge: Arc<dyn PolymarketEvidenceBridge>,
+    ) -> anyhow::Result<Self> {
+        if !config.pre_activate_expected_order_ids {
+            anyhow::bail!(
+                "durable Polymarket evidence requires pre_activate_expected_order_ids=true"
+            );
+        }
+        if config.builder_attribution != PolymarketBuilderAttribution::None {
+            anyhow::bail!("durable Polymarket evidence requires zero builder attribution");
+        }
+        Self::new_inner(core, config, Some(evidence_bridge))
+    }
+
+    fn new_inner(
+        core: ExecutionClientCore,
+        config: PolymarketExecClientConfig,
+        evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
     ) -> anyhow::Result<Self> {
         let proxy_url = config.validated_proxy_url()?;
         let secrets = Secrets::resolve(
@@ -179,12 +216,22 @@ impl PolymarketExecutionClient {
         };
         let submitter = OrderSubmitter::new(http_client.clone(), order_builder, retry_config);
 
-        let ws_client = PolymarketWebSocketClient::new_user_with_proxy(
-            config.base_url_ws.clone(),
-            secrets.credential.clone(),
-            config.transport_backend,
-            proxy_url,
-        );
+        let ws_client = if let Some(bridge) = &evidence_bridge {
+            PolymarketWebSocketClient::new_user_with_proxy_and_evidence(
+                config.base_url_ws.clone(),
+                secrets.credential.clone(),
+                config.transport_backend,
+                proxy_url,
+                bridge.clone(),
+            )
+        } else {
+            PolymarketWebSocketClient::new_user_with_proxy(
+                config.base_url_ws.clone(),
+                secrets.credential.clone(),
+                config.transport_backend,
+                proxy_url,
+            )
+        };
 
         let clock = get_atomic_clock_realtime();
         let pusd = get_pusd_currency();
@@ -220,6 +267,7 @@ impl PolymarketExecutionClient {
             order_identities: Arc::new(OrderIdentityRegistry::default()),
             fill_tracker: Arc::new(OrderFillTrackerMap::new()),
             ws_dispatch_state: Arc::new(Mutex::new(WsDispatchState::default())),
+            evidence_bridge,
         })
     }
 }

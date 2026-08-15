@@ -39,9 +39,19 @@ use super::{
         reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
-    types::{BatchLimitOrderContext, LimitOrderSubmitRequest, PreparedLimitHttpRequest},
+    types::{
+        BatchLimitOrderContext, LimitOrderSubmitRequest, PreparedLimitHttpRequest,
+        SignedLimitOrderSubmission,
+    },
 };
-use crate::common::consts::{BATCH_ORDER_LIMIT, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM};
+use crate::{
+    common::consts::{BATCH_ORDER_LIMIT, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM},
+    evidence::{
+        PolymarketEvidenceBridge, PolymarketEvidenceError, PolymarketHandoffStarted,
+        PolymarketMutationEndpoint, PolymarketMutationEvidence, PolymarketSignedLimitEvidence,
+        PolymarketSubmitPrepared,
+    },
+};
 
 fn requires_prepare_all_or_none(cmd: &SubmitOrderList) -> bool {
     cmd.params
@@ -67,6 +77,47 @@ fn prepared_request_matches_orders(
     prepared.client_order_ids().iter().copied().eq(orders
         .iter()
         .map(|batch_order| batch_order.order.client_order_id()))
+}
+
+fn build_submit_prepared_evidence(
+    prepared: &PreparedLimitHttpRequest,
+    submissions: &[SignedLimitOrderSubmission],
+    orders: &[OrderAny],
+) -> Result<PolymarketSubmitPrepared, PolymarketEvidenceError> {
+    if submissions.len() != orders.len()
+        || submissions.len() != prepared.expected_venue_order_ids().len()
+    {
+        return Err(PolymarketEvidenceError::InvalidFact);
+    }
+    let endpoint = match prepared.endpoint() {
+        super::types::LimitHttpRequestEndpoint::Single => PolymarketMutationEndpoint::Single,
+        super::types::LimitHttpRequestEndpoint::Batch => PolymarketMutationEndpoint::Batch,
+    };
+    let legs = submissions
+        .iter()
+        .zip(orders)
+        .map(|(submission, order)| {
+            PolymarketSignedLimitEvidence::new(
+                submission.order().clone(),
+                submission.order_type(),
+                submission.post_only(),
+                submission.expected_venue_order_id(),
+                order.client_order_id(),
+            )
+        })
+        .collect();
+    PolymarketSubmitPrepared::try_new(endpoint, prepared.body_sha256(), legs)
+}
+
+async fn append_mutation_evidence(
+    bridge: &dyn PolymarketEvidenceBridge,
+    fact: &PolymarketMutationEvidence<'_>,
+) -> Result<(), PolymarketEvidenceError> {
+    let ack = bridge.append_mutation(fact).await?;
+    if ack.fact_id() != fact.fact_id() {
+        return Err(PolymarketEvidenceError::InvalidAcknowledgement);
+    }
+    Ok(())
 }
 
 impl PolymarketExecutionClient {
@@ -122,6 +173,7 @@ impl PolymarketExecutionClient {
         let size_precision = instrument.size_precision();
         let price_precision = instrument.price_precision();
         let pre_activate_expected_order_ids = self.config.pre_activate_expected_order_ids;
+        let evidence_bridge = self.evidence_bridge.clone();
 
         self.spawn_task("submit_limit_order", async move {
             let submission = match submitter.prepare_limit_order_submission(&request).await {
@@ -140,6 +192,44 @@ impl PolymarketExecutionClient {
                     reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
                     return Ok(());
                 }
+            };
+
+            let prepared_evidence = if let Some(bridge) = &evidence_bridge {
+                let evidence = match build_submit_prepared_evidence(
+                    &prepared_request,
+                    std::slice::from_ref(&submission),
+                    std::slice::from_ref(&order),
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        reject_submit_order(
+                            &order,
+                            &format!("Durable prepared evidence failed: {error}"),
+                            &emitter,
+                            clock,
+                            &pending_cancels,
+                        );
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = append_mutation_evidence(
+                    bridge.as_ref(),
+                    &PolymarketMutationEvidence::SubmitPrepared(&evidence),
+                )
+                .await
+                {
+                    reject_submit_order(
+                        &order,
+                        &format!("Durable prepared evidence failed: {error}"),
+                        &emitter,
+                        clock,
+                        &pending_cancels,
+                    );
+                    return Ok(());
+                }
+                Some(evidence)
+            } else {
+                None
             };
 
             let expected_venue_order_id = prepared_request.expected_venue_order_ids()[0];
@@ -166,6 +256,35 @@ impl PolymarketExecutionClient {
             } else {
                 None
             };
+            if let (Some(bridge), Some(prepared_evidence)) = (&evidence_bridge, &prepared_evidence)
+            {
+                if !prepared_request.body_hash_matches() {
+                    reject_submit_order(
+                        &order,
+                        "Prepared HTTP request body hash changed before durable handoff",
+                        &emitter,
+                        clock,
+                        &pending_cancels,
+                    );
+                    return Ok(());
+                }
+                let handoff = PolymarketHandoffStarted::new(prepared_evidence);
+                if let Err(error) = append_mutation_evidence(
+                    bridge.as_ref(),
+                    &PolymarketMutationEvidence::HandoffStarted(handoff),
+                )
+                .await
+                {
+                    reject_submit_order(
+                        &order,
+                        &format!("Durable HTTP handoff evidence failed: {error}"),
+                        &emitter,
+                        clock,
+                        &pending_cancels,
+                    );
+                    return Ok(());
+                }
+            }
             if let Some(activation) = &mut activation {
                 activation.mark_http_handoff_started();
             }
@@ -471,6 +590,10 @@ impl PolymarketExecutionClient {
 
         match order.order_type() {
             OrderType::Limit => self.submit_limit_order(order),
+            OrderType::Market if self.evidence_bridge.is_some() => self.emitter.emit_order_denied(
+                &order,
+                "Native market orders are unavailable on the durable evidence path; use an explicit aggressive LIMIT FOK",
+            ),
             OrderType::Market => self.submit_market_order(order),
             _ => {
                 self.emitter.emit_order_denied(
@@ -489,9 +612,11 @@ impl PolymarketExecutionClient {
         let mut batch_orders = Vec::with_capacity(cmd.order_inits.len());
         let prepare_all_or_none = requires_prepare_all_or_none(cmd);
         let mut plan_orders = Vec::with_capacity(cmd.order_inits.len());
-        let mut plan_failure = if prepare_all_or_none
-            && !(1..=BATCH_ORDER_LIMIT).contains(&cmd.order_inits.len())
-        {
+        let mut plan_failure = if self.evidence_bridge.is_some() && !prepare_all_or_none {
+            Some(
+                "Durable Polymarket evidence requires a prepare-all-or-none order list".to_string(),
+            )
+        } else if prepare_all_or_none && !(1..=BATCH_ORDER_LIMIT).contains(&cmd.order_inits.len()) {
             Some(format!(
                 "Prepare-all-or-none order list must contain 1..={BATCH_ORDER_LIMIT} orders, found {}",
                 cmd.order_inits.len()
@@ -674,6 +799,7 @@ impl PolymarketExecutionClient {
         let account_id = self.core.account_id;
         let pre_activate_expected_order_ids =
             self.config.pre_activate_expected_order_ids && prepare_all_or_none;
+        let evidence_bridge = self.evidence_bridge.clone();
 
         self.spawn_task("submit_order_list", async move {
             if !prepare_all_or_none {
@@ -760,6 +886,46 @@ impl PolymarketExecutionClient {
                 None
             };
 
+            let prepared_evidence = if let (Some(bridge), Some(prepared_request)) =
+                (&evidence_bridge, &prepared_all_request)
+            {
+                let orders: Vec<OrderAny> = prepared_orders
+                    .iter()
+                    .map(|batch_order| batch_order.order.clone())
+                    .collect();
+                let evidence = match build_submit_prepared_evidence(
+                    prepared_request,
+                    &submissions,
+                    &orders,
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        deny_prepare_all_or_none_batch(
+                            &emitter,
+                            &plan_orders,
+                            &format!("Durable prepared evidence failed: {error}"),
+                        );
+                        return Ok(());
+                    }
+                };
+                if let Err(error) = append_mutation_evidence(
+                    bridge.as_ref(),
+                    &PolymarketMutationEvidence::SubmitPrepared(&evidence),
+                )
+                .await
+                {
+                    deny_prepare_all_or_none_batch(
+                        &emitter,
+                        &plan_orders,
+                        &format!("Durable prepared evidence failed: {error}"),
+                    );
+                    return Ok(());
+                }
+                Some(evidence)
+            } else {
+                None
+            };
+
             let mut activations: Vec<ExpectedSubmitActivation> =
                 Vec::with_capacity(submissions.len());
             if pre_activate_expected_order_ids {
@@ -786,6 +952,35 @@ impl PolymarketExecutionClient {
             if prepare_all_or_none {
                 for batch_order in &prepared_orders {
                     emitter.emit_order_submitted(&batch_order.order);
+                }
+            }
+
+            if let (Some(bridge), Some(prepared_request), Some(prepared_evidence)) = (
+                &evidence_bridge,
+                &prepared_all_request,
+                &prepared_evidence,
+            ) {
+                if !prepared_request.body_hash_matches() {
+                    deny_prepare_all_or_none_batch(
+                        &emitter,
+                        &plan_orders,
+                        "Prepared HTTP request body hash changed before durable handoff",
+                    );
+                    return Ok(());
+                }
+                let handoff = PolymarketHandoffStarted::new(prepared_evidence);
+                if let Err(error) = append_mutation_evidence(
+                    bridge.as_ref(),
+                    &PolymarketMutationEvidence::HandoffStarted(handoff),
+                )
+                .await
+                {
+                    deny_prepare_all_or_none_batch(
+                        &emitter,
+                        &plan_orders,
+                        &format!("Durable HTTP handoff evidence failed: {error}"),
+                    );
+                    return Ok(());
                 }
             }
 
