@@ -36,6 +36,7 @@ use crate::{
     common::consts::{POLYMARKET, POLYMARKET_VENUE},
     config::{PolymarketDataClientConfig, PolymarketExecClientConfig},
     data::PolymarketDataClient,
+    evidence::PolymarketEvidenceBridge,
     execution::PolymarketExecutionClient,
     http::{
         clob::PolymarketClobPublicClient, data_api::PolymarketDataApiHttpClient,
@@ -184,30 +185,8 @@ impl ExecutionClientFactory for PolymarketExecutionClientFactory {
         config: &dyn ClientConfig,
         cache: CacheView,
     ) -> anyhow::Result<Box<dyn ExecutionClient>> {
-        let polymarket_config = config
-            .as_any()
-            .downcast_ref::<PolymarketExecClientConfig>()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid config type for PolymarketExecutionClientFactory. Expected PolymarketExecClientConfig, was {config:?}",
-                )
-            })?
-            .clone();
-
-        let oms_type = OmsType::Netting;
-        let account_type = AccountType::Cash;
-
-        let client_id = ClientId::from(name);
-        let core = ExecutionClientCore::new(
-            polymarket_config.trader_id,
-            client_id,
-            *POLYMARKET_VENUE,
-            oms_type,
-            polymarket_config.account_id,
-            account_type,
-            None, // base_currency
-            cache,
-        );
+        let polymarket_config = downcast_exec_config(config, "PolymarketExecutionClientFactory")?;
+        let core = create_exec_core(name, &polymarket_config, cache);
 
         let client = PolymarketExecutionClient::new(core, polymarket_config)?;
 
@@ -221,6 +200,85 @@ impl ExecutionClientFactory for PolymarketExecutionClientFactory {
     fn config_type(&self) -> &'static str {
         "PolymarketExecClientConfig"
     }
+}
+
+/// Factory for execution clients backed by one application-owned durable evidence bridge.
+///
+/// This is the public composition seam for a native [`nautilus_live::node::LiveNode`]. The bridge
+/// instance is injected before node construction and shared with every execution client created by
+/// this factory. The stock [`PolymarketExecutionClientFactory`] remains unchanged for callers which
+/// do not require the durable-evidence contract.
+#[derive(Debug, Clone)]
+pub struct PolymarketEvidenceExecutionClientFactory {
+    evidence_bridge: Arc<dyn PolymarketEvidenceBridge>,
+}
+
+impl PolymarketEvidenceExecutionClientFactory {
+    /// Creates a bridge-aware execution-client factory.
+    #[must_use]
+    pub fn new(evidence_bridge: Arc<dyn PolymarketEvidenceBridge>) -> Self {
+        Self { evidence_bridge }
+    }
+}
+
+impl ExecutionClientFactory for PolymarketEvidenceExecutionClientFactory {
+    fn create(
+        &self,
+        name: &str,
+        config: &dyn ClientConfig,
+        cache: CacheView,
+    ) -> anyhow::Result<Box<dyn ExecutionClient>> {
+        let polymarket_config =
+            downcast_exec_config(config, "PolymarketEvidenceExecutionClientFactory")?;
+        let core = create_exec_core(name, &polymarket_config, cache);
+        let client = PolymarketExecutionClient::new_with_evidence_bridge(
+            core,
+            polymarket_config,
+            Arc::clone(&self.evidence_bridge),
+        )?;
+
+        Ok(Box::new(client))
+    }
+
+    fn name(&self) -> &'static str {
+        POLYMARKET
+    }
+
+    fn config_type(&self) -> &'static str {
+        "PolymarketExecClientConfig"
+    }
+}
+
+fn downcast_exec_config(
+    config: &dyn ClientConfig,
+    factory_name: &str,
+) -> anyhow::Result<PolymarketExecClientConfig> {
+    config
+        .as_any()
+        .downcast_ref::<PolymarketExecClientConfig>()
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid config type for {factory_name}. Expected PolymarketExecClientConfig, was {config:?}",
+            )
+        })
+}
+
+fn create_exec_core(
+    name: &str,
+    config: &PolymarketExecClientConfig,
+    cache: CacheView,
+) -> ExecutionClientCore {
+    ExecutionClientCore::new(
+        config.trader_id,
+        ClientId::from(name),
+        *POLYMARKET_VENUE,
+        OmsType::Netting,
+        config.account_id,
+        AccountType::Cash,
+        None, // base_currency
+        cache,
+    )
 }
 
 #[cfg(test)]
