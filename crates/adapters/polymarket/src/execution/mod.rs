@@ -107,6 +107,7 @@ pub struct PolymarketExecutionClient {
     ws_stream_handle: Option<JoinHandle<()>>,
     heartbeat_task: Option<HeartbeatTask>,
     heartbeat_healthy: Arc<AtomicBool>,
+    user_stream_healthy: Arc<AtomicBool>,
     order_event_handler: Option<TypedHandler<OrderEventAny>>,
     position_event_handler: Option<TypedHandler<PositionEvent>>,
     shared_token_instruments: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -205,7 +206,7 @@ impl PolymarketExecutionClient {
         let order_builder = Arc::new(PolymarketOrderBuilder::new_with_builder_attribution(
             order_signer,
             signer_address,
-            maker_address,
+            maker_address.clone(),
             config.signature_type,
             config.builder_attribution,
         ));
@@ -229,6 +230,7 @@ impl PolymarketExecutionClient {
                 config.transport_backend,
                 proxy_url,
                 bridge.clone(),
+                maker_address,
             )
         } else {
             PolymarketWebSocketClient::new_user_with_proxy(
@@ -264,6 +266,7 @@ impl PolymarketExecutionClient {
             ws_stream_handle: None,
             heartbeat_task: None,
             heartbeat_healthy: Arc::new(AtomicBool::new(true)),
+            user_stream_healthy: Arc::new(AtomicBool::new(true)),
             order_event_handler: None,
             position_event_handler: None,
             shared_token_instruments: Arc::new(AtomicMap::new()),
@@ -314,6 +317,9 @@ fn resolve_maker_address(
 impl ExecutionClient for PolymarketExecutionClient {
     fn is_connected(&self) -> bool {
         self.core.is_connected()
+            && self
+                .user_stream_healthy
+                .load(std::sync::atomic::Ordering::Acquire)
             && (!self.config.heartbeat_enabled
                 || self
                     .heartbeat_healthy

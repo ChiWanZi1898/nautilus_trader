@@ -23,7 +23,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -34,7 +34,7 @@ use axum::{
     body::Bytes,
     extract::{
         Query, State,
-        ws::{WebSocket, WebSocketUpgrade},
+        ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
@@ -87,9 +87,10 @@ use nautilus_polymarket::{
     },
     config::PolymarketExecClientConfig,
     evidence::{
-        PolymarketAuthenticatedUserFrame, PolymarketEvidenceAck, PolymarketEvidenceBridge,
-        PolymarketEvidenceError, PolymarketEvidenceRecovery, PolymarketMutationEvidence,
+        PolymarketEvidenceAck, PolymarketEvidenceBridge, PolymarketEvidenceError,
+        PolymarketEvidenceRecovery, PolymarketMutationEvidence,
     },
+    evidence_v2::PolymarketAuthenticatedUserFrameV2,
     execution::PolymarketExecutionClient,
     http::models::PolymarketOrder,
     signing::eip712::order_hash,
@@ -227,6 +228,7 @@ struct TestServerState {
     book_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
+    user_ws_payload: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl Default for TestServerState {
@@ -277,6 +279,7 @@ impl Default for TestServerState {
             orders_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
+            user_ws_payload: Arc::new(tokio::sync::Mutex::new(None)),
             book_response: Arc::new(tokio::sync::Mutex::new(Some(json!({
                 "bids": [
                     {"price": "0.48", "size": "100.00"},
@@ -313,6 +316,7 @@ enum ObservedEvidenceKind {
 struct TestEvidenceBridge {
     observed: tokio::sync::Mutex<Vec<(ObservedEvidenceKind, [u8; 32], usize)>>,
     fail_on_append: AtomicUsize,
+    inbound_sequence: AtomicU64,
 }
 
 impl TestEvidenceBridge {
@@ -369,9 +373,10 @@ impl PolymarketEvidenceBridge for TestEvidenceBridge {
 
     async fn append_authenticated_user_frame(
         &self,
-        fact: &PolymarketAuthenticatedUserFrame,
+        fact: &PolymarketAuthenticatedUserFrameV2,
     ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
-        PolymarketEvidenceAck::try_new(*fact.fact_id(), 1)
+        let sequence = self.inbound_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        PolymarketEvidenceAck::try_new(*fact.fact_id(), sequence)
     }
 }
 
@@ -785,11 +790,19 @@ async fn record_canceled_order_ids(state: &TestServerState, response: &Value) {
     }
 }
 
-async fn handle_user_upgrade(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_user_socket)
+async fn handle_user_upgrade(
+    State(state): State<TestServerState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| handle_user_socket(socket, state))
 }
 
-async fn handle_user_socket(mut socket: WebSocket) {
+async fn handle_user_socket(mut socket: WebSocket, state: TestServerState) {
+    if socket.next().await.is_some()
+        && let Some(payload) = state.user_ws_payload.lock().await.clone()
+    {
+        let _ = socket.send(AxumWsMessage::Text(payload.into())).await;
+    }
     while socket.next().await.is_some() {}
 }
 
@@ -1065,6 +1078,30 @@ async fn test_heartbeat_disabled_preserves_connection_behavior() {
 
     client.disconnect().await.unwrap();
     assert!(!client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_fatal_user_evidence_failure_revokes_health_without_heartbeat() {
+    let state = TestServerState::default();
+    *state.user_ws_payload.lock().await =
+        Some(r#"{"event_type":"trade","unknown":"strict-v2-rejects"}"#.to_owned());
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.heartbeat_enabled = false;
+    config.pre_activate_expected_order_ids = true;
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let bridge = Arc::new(TestEvidenceBridge::default());
+    let (mut client, _rx, cache) =
+        create_test_execution_client_from_config_and_bridge(config, Some(bridge));
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+    await_execution_unhealthy(&client, Duration::from_secs(5)).await;
+
+    assert!(!client.is_connected());
+    client.disconnect().await.unwrap();
 }
 
 #[rstest]

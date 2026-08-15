@@ -9,21 +9,36 @@
 
 //! Strict credential-free projection of authenticated Polymarket user frames.
 //!
-//! This module is deliberately not wired into the live user lane yet. It freezes the V2 canonical
-//! evidence contract required by the following atomic persistence/replay cutover. Credential wire
-//! fields are compared transiently and cannot be retained by any public output type.
+//! The authenticated user lane projects each complete wire frame into this canonical form before
+//! durable append and releases normalized lifecycle messages only after the matching durability
+//! acknowledgement. Credential wire fields are compared transiently and cannot be retained by any
+//! public output type.
 
 use std::{
     fmt::{Debug, Formatter},
     marker::PhantomData,
+    str::FromStr,
 };
 
 use aws_lc_rs::digest::{self, SHA256};
+use rust_decimal::Decimal;
 use serde::{
     Deserialize, Deserializer,
     de::{Error as DeError, SeqAccess, Visitor},
 };
 use thiserror::Error;
+use ustr::Ustr;
+
+use crate::{
+    common::{
+        enums::{
+            PolymarketEventType, PolymarketLiquiditySide, PolymarketOrderSide,
+            PolymarketOrderStatus, PolymarketOrderType, PolymarketOutcome, PolymarketTradeStatus,
+        },
+        models::PolymarketMakerOrder,
+    },
+    websocket::messages::{PolymarketUserOrder, PolymarketUserTrade, UserWsMessage},
+};
 
 const HASH_DOMAIN: &[u8] = b"nautilus-polymarket/authenticated-user-frame/v2\0";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -31,6 +46,8 @@ const MAX_ELEMENTS: usize = 1024;
 const MAX_NESTED: usize = 1024;
 const MAX_TEXT: usize = 512;
 const MAX_DECIMAL: usize = 128;
+const OWNED_RELATION_MARKER: &str = "__POLYMARKET_EVIDENCE_OWNED__";
+const FOREIGN_RELATION_MARKER: &str = "__POLYMARKET_EVIDENCE_FOREIGN__";
 
 struct BoundedVec<T, const MAX: usize>(Vec<T>);
 
@@ -306,6 +323,29 @@ impl PolymarketOrderEvidenceV2 {
     pub const fn size_matched(&self) -> PolymarketWireDecimalV2 {
         self.size_matched
     }
+
+    fn to_dispatch_message(&self) -> Result<PolymarketUserOrder, PolymarketEvidenceV2Error> {
+        Ok(PolymarketUserOrder {
+            asset_id: Ustr::from(self.asset_id.as_str()),
+            associate_trades: Some(self.associated_trades.to_vec()),
+            created_at: self.created_at.clone().unwrap_or_default(),
+            expiration: self.expiration.clone(),
+            id: self.order_id.clone(),
+            maker_address: Ustr::from(self.maker_address.as_str()),
+            market: Ustr::from(self.market.as_str()),
+            order_owner: Ustr::from(relation_marker(self.ownership.order_owner_matches_api_key)),
+            order_type: dispatch_order_type(self.order_type),
+            original_size: dispatch_decimal_text(self.original_size)?,
+            outcome: PolymarketOutcome::from(self.outcome.as_deref().unwrap_or("")),
+            owner: Ustr::from(relation_marker(self.ownership.owner_matches_api_key)),
+            price: dispatch_decimal_text(self.price)?,
+            side: dispatch_side(self.side),
+            size_matched: dispatch_decimal_text(self.size_matched)?,
+            status: dispatch_order_status(self.status),
+            timestamp: self.timestamp.clone(),
+            event_type: dispatch_event(self.event),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -346,6 +386,60 @@ impl PolymarketTradeEvidenceV2 {
     #[must_use]
     pub fn maker_rows(&self) -> &[PolymarketMakerEvidenceV2] {
         &self.maker_rows
+    }
+
+    fn to_dispatch_message(&self) -> Result<PolymarketUserTrade, PolymarketEvidenceV2Error> {
+        let mut maker_orders = Vec::new();
+        maker_orders
+            .try_reserve_exact(self.maker_rows.len())
+            .map_err(|_| PolymarketEvidenceV2Error::Capacity)?;
+        for maker in &self.maker_rows {
+            maker_orders.push(maker.to_dispatch_message()?);
+        }
+        Ok(PolymarketUserTrade {
+            asset_id: Ustr::from(self.asset_id.as_str()),
+            bucket_index: self.bucket_index,
+            fee_rate_bps: self
+                .fee_rate_bps
+                .map(dispatch_decimal_text)
+                .transpose()?
+                .unwrap_or_default(),
+            id: self.trade_id.clone(),
+            last_update: self.last_update.clone(),
+            maker_address: Ustr::from(self.maker_address.as_str()),
+            maker_orders,
+            market: Ustr::from(self.market.as_str()),
+            match_time: self.match_time.clone(),
+            outcome: PolymarketOutcome::from(self.outcome.as_deref().unwrap_or("")),
+            owner: Ustr::from(relation_marker(self.ownership.owner_matches_api_key)),
+            price: dispatch_decimal_text(self.price)?,
+            side: dispatch_side(self.side),
+            size: dispatch_decimal_text(self.size)?,
+            status: dispatch_trade_status(self.status),
+            taker_order_id: self.taker_order_id.clone(),
+            timestamp: self.timestamp.clone(),
+            trade_owner: Ustr::from(relation_marker(self.ownership.trade_owner_matches_api_key)),
+            transaction_hash: self.transaction_hash.clone(),
+            trader_side: dispatch_role(self.role),
+            event_type: dispatch_event(self.event),
+        })
+    }
+}
+
+impl PolymarketMakerEvidenceV2 {
+    fn to_dispatch_message(&self) -> Result<PolymarketMakerOrder, PolymarketEvidenceV2Error> {
+        Ok(PolymarketMakerOrder {
+            asset_id: Ustr::from(self.asset_id.as_str()),
+            maker_address: self.maker_address.clone(),
+            matched_amount: Decimal::from_str(&dispatch_decimal_text(self.matched_amount)?)
+                .map_err(|_| PolymarketEvidenceV2Error::InvalidDecimal)?,
+            order_id: self.order_id.clone(),
+            outcome: PolymarketOutcome::from(self.outcome.as_deref().unwrap_or("")),
+            owner: relation_marker(self.ownership.owner_matches_api_key).to_owned(),
+            price: Decimal::from_str(&dispatch_decimal_text(self.price)?)
+                .map_err(|_| PolymarketEvidenceV2Error::InvalidDecimal)?,
+            side: self.side.map(dispatch_side),
+        })
     }
 }
 
@@ -392,6 +486,95 @@ impl PolymarketMakerOwnershipV2 {
     #[must_use]
     pub const fn owner_matches_api_key(self) -> bool {
         self.owner_matches_api_key
+    }
+}
+
+const fn relation_marker(matches: bool) -> &'static str {
+    if matches {
+        OWNED_RELATION_MARKER
+    } else {
+        FOREIGN_RELATION_MARKER
+    }
+}
+
+fn decimal_text(value: PolymarketWireDecimalV2) -> String {
+    let mut digits = value.mantissa.to_string();
+    let scale = usize::from(value.scale);
+    if scale == 0 {
+        return digits;
+    }
+    if digits.len() > scale {
+        digits.insert(digits.len() - scale, '.');
+        digits
+    } else {
+        format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+    }
+}
+
+fn dispatch_decimal_text(
+    value: PolymarketWireDecimalV2,
+) -> Result<String, PolymarketEvidenceV2Error> {
+    let text = decimal_text(value);
+    Decimal::from_str(&text).map_err(|_| PolymarketEvidenceV2Error::InvalidDecimal)?;
+    Ok(text)
+}
+
+const fn dispatch_side(value: PolymarketEvidenceSideV2) -> PolymarketOrderSide {
+    match value {
+        PolymarketEvidenceSideV2::Buy => PolymarketOrderSide::Buy,
+        PolymarketEvidenceSideV2::Sell => PolymarketOrderSide::Sell,
+    }
+}
+
+const fn dispatch_role(value: PolymarketEvidenceRoleV2) -> PolymarketLiquiditySide {
+    match value {
+        PolymarketEvidenceRoleV2::Maker => PolymarketLiquiditySide::Maker,
+        PolymarketEvidenceRoleV2::Taker => PolymarketLiquiditySide::Taker,
+    }
+}
+
+const fn dispatch_event(value: PolymarketEvidenceEventV2) -> PolymarketEventType {
+    match value {
+        PolymarketEvidenceEventV2::Placement => PolymarketEventType::Placement,
+        PolymarketEvidenceEventV2::Update => PolymarketEventType::Update,
+        PolymarketEvidenceEventV2::Cancellation => PolymarketEventType::Cancellation,
+        PolymarketEvidenceEventV2::Trade => PolymarketEventType::Trade,
+    }
+}
+
+const fn dispatch_order_type(value: PolymarketEvidenceOrderTypeV2) -> PolymarketOrderType {
+    match value {
+        PolymarketEvidenceOrderTypeV2::Fok => PolymarketOrderType::FOK,
+        PolymarketEvidenceOrderTypeV2::Fak => PolymarketOrderType::FAK,
+        PolymarketEvidenceOrderTypeV2::Gtc => PolymarketOrderType::GTC,
+        PolymarketEvidenceOrderTypeV2::Gtd => PolymarketOrderType::GTD,
+    }
+}
+
+const fn dispatch_order_status(value: PolymarketEvidenceOrderStatusV2) -> PolymarketOrderStatus {
+    match value {
+        PolymarketEvidenceOrderStatusV2::Invalid => PolymarketOrderStatus::Invalid,
+        PolymarketEvidenceOrderStatusV2::Live => PolymarketOrderStatus::Live,
+        PolymarketEvidenceOrderStatusV2::Delayed => PolymarketOrderStatus::Delayed,
+        PolymarketEvidenceOrderStatusV2::Matched => PolymarketOrderStatus::Matched,
+        PolymarketEvidenceOrderStatusV2::Unmatched => PolymarketOrderStatus::Unmatched,
+        PolymarketEvidenceOrderStatusV2::Canceled => PolymarketOrderStatus::Canceled,
+        PolymarketEvidenceOrderStatusV2::CanceledMarketResolved => {
+            PolymarketOrderStatus::CanceledMarketResolved
+        }
+    }
+}
+
+const fn dispatch_trade_status(value: PolymarketEvidenceTradeStatusV2) -> PolymarketTradeStatus {
+    match value {
+        PolymarketEvidenceTradeStatusV2::MatchedNotBroadcasted => {
+            PolymarketTradeStatus::MatchedNotBroadcasted
+        }
+        PolymarketEvidenceTradeStatusV2::Matched => PolymarketTradeStatus::Matched,
+        PolymarketEvidenceTradeStatusV2::Mined => PolymarketTradeStatus::Mined,
+        PolymarketEvidenceTradeStatusV2::Confirmed => PolymarketTradeStatus::Confirmed,
+        PolymarketEvidenceTradeStatusV2::Retrying => PolymarketTradeStatus::Retrying,
+        PolymarketEvidenceTradeStatusV2::Failed => PolymarketTradeStatus::Failed,
     }
 }
 
@@ -499,6 +682,60 @@ impl PolymarketAuthenticatedUserFrameV2 {
         })
     }
 
+    /// Restores, strictly decodes, and rehashes one canonical credential-free V2 frame.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed fields, bounds, trailing bytes, noncanonical values, or a fact identity
+    /// which does not match the canonical body.
+    pub fn try_restore(canonical: &[u8]) -> Result<Self, PolymarketEvidenceV2Error> {
+        if canonical.len() > MAX_FRAME_BYTES {
+            return Err(PolymarketEvidenceV2Error::Capacity);
+        }
+        let mut reader = CanonicalReader::new(canonical);
+        let fact_id = reader.array()?;
+        if reader.byte()? != 2 {
+            return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+        }
+        let session_epoch = reader.u64()?;
+        let frame_sequence = reader.u64()?;
+        let envelope = decode_envelope(reader.byte()?)?;
+        let count = usize::from(reader.u16()?);
+        if session_epoch == 0
+            || frame_sequence == 0
+            || count == 0
+            || count > MAX_ELEMENTS
+            || (envelope == PolymarketEvidenceEnvelopeV2::Single && count != 1)
+        {
+            return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+        }
+        let mut elements = Vec::new();
+        elements
+            .try_reserve_exact(count)
+            .map_err(|_| PolymarketEvidenceV2Error::Capacity)?;
+        for _ in 0..count {
+            elements.push(decode_element(&mut reader)?);
+        }
+        reader.finish()?;
+        let body = encode_body(session_epoch, frame_sequence, envelope, &elements)?;
+        let mut context = digest::Context::new(&SHA256);
+        context.update(HASH_DOMAIN);
+        context.update(&body);
+        let expected_fact_id = <[u8; 32]>::try_from(context.finish().as_ref())
+            .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)?;
+        if fact_id != expected_fact_id || canonical.get(32..) != Some(body.as_slice()) {
+            return Err(PolymarketEvidenceV2Error::FactIdMismatch);
+        }
+        Ok(Self {
+            fact_id,
+            canonical_bytes: canonical.into(),
+            session_epoch,
+            frame_sequence,
+            envelope,
+            elements: elements.into_boxed_slice(),
+        })
+    }
+
     #[must_use]
     pub const fn fact_id(&self) -> &[u8; 32] {
         &self.fact_id
@@ -528,6 +765,34 @@ impl PolymarketAuthenticatedUserFrameV2 {
     pub fn elements(&self) -> &[PolymarketUserEvidenceElementV2] {
         &self.elements
     }
+
+    /// Reconstructs credential-free normalized messages for the existing lifecycle reducer.
+    ///
+    /// Credential ownership is represented only by fixed non-secret relation markers. This is an
+    /// internal compatibility seam for live/recovery dispatch, not a wire or persistence format.
+    pub(crate) fn to_dispatch_messages(
+        &self,
+    ) -> Result<Vec<UserWsMessage>, PolymarketEvidenceV2Error> {
+        let mut messages = Vec::new();
+        messages
+            .try_reserve_exact(self.elements.len())
+            .map_err(|_| PolymarketEvidenceV2Error::Capacity)?;
+        for element in &self.elements {
+            messages.push(match element {
+                PolymarketUserEvidenceElementV2::Order(order) => {
+                    UserWsMessage::Order(order.to_dispatch_message()?)
+                }
+                PolymarketUserEvidenceElementV2::Trade(trade) => {
+                    UserWsMessage::Trade(trade.to_dispatch_message()?)
+                }
+            });
+        }
+        Ok(messages)
+    }
+}
+
+pub(crate) const fn dispatch_api_key_marker() -> &'static str {
+    OWNED_RELATION_MARKER
 }
 
 #[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
@@ -542,6 +807,10 @@ pub enum PolymarketEvidenceV2Error {
     InvalidDecimal,
     #[error("authenticated user frame exceeds a hard capacity")]
     Capacity,
+    #[error("credential-free authenticated user frame encoding is invalid")]
+    InvalidEncoding,
+    #[error("credential-free authenticated user frame identity does not match its content")]
+    FactIdMismatch,
 }
 
 #[derive(Deserialize)]
@@ -1104,6 +1373,348 @@ fn put_optional_decimal(output: &mut Vec<u8>, value: Option<PolymarketWireDecima
     }
 }
 
+fn decode_envelope(value: u8) -> Result<PolymarketEvidenceEnvelopeV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceEnvelopeV2::Single),
+        2 => Ok(PolymarketEvidenceEnvelopeV2::Batch),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_element(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<PolymarketUserEvidenceElementV2, PolymarketEvidenceV2Error> {
+    match reader.byte()? {
+        1 => {
+            let order = PolymarketOrderEvidenceV2 {
+                asset_id: reader.text()?,
+                associated_trades: reader.texts()?.into_boxed_slice(),
+                created_at: reader.optional_text()?,
+                expiration: reader.optional_text()?,
+                order_id: reader.text()?,
+                maker_address: reader.text()?,
+                market: reader.text()?,
+                ownership: decode_order_ownership(reader.byte()?)?,
+                order_type: decode_order_type(reader.byte()?)?,
+                original_size: reader.decimal()?,
+                outcome: reader.optional_text()?,
+                price: reader.decimal()?,
+                side: decode_side(reader.byte()?)?,
+                size_matched: reader.decimal()?,
+                status: decode_order_status(reader.byte()?)?,
+                status_detail: reader.optional_text()?,
+                timestamp: reader.text()?,
+                event: decode_event(reader.byte()?)?,
+            };
+            validate_unsigned(&order.timestamp)?;
+            if let Some(value) = order.created_at.as_deref() {
+                validate_unsigned(value)?;
+            }
+            if let Some(value) = order.expiration.as_deref() {
+                validate_unsigned(value)?;
+            }
+            if order.event == PolymarketEvidenceEventV2::Trade {
+                return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+            }
+            Ok(PolymarketUserEvidenceElementV2::Order(order))
+        }
+        2 => {
+            let asset_id = reader.text()?;
+            let bucket_index = reader.u64()?;
+            let fee_rate_bps = reader.optional_decimal()?;
+            let trade_id = reader.text()?;
+            let last_update = reader.text()?;
+            let maker_address = reader.text()?;
+            let maker_count = usize::from(reader.u16()?);
+            if maker_count > MAX_NESTED {
+                return Err(PolymarketEvidenceV2Error::Capacity);
+            }
+            let mut maker_rows = Vec::new();
+            maker_rows
+                .try_reserve_exact(maker_count)
+                .map_err(|_| PolymarketEvidenceV2Error::Capacity)?;
+            for _ in 0..maker_count {
+                maker_rows.push(decode_maker(reader)?);
+            }
+            let trade = PolymarketTradeEvidenceV2 {
+                asset_id,
+                bucket_index,
+                fee_rate_bps,
+                trade_id,
+                last_update,
+                maker_address,
+                maker_rows: maker_rows.into_boxed_slice(),
+                market: reader.text()?,
+                match_time: reader.text()?,
+                outcome: reader.optional_text()?,
+                ownership: decode_trade_ownership(reader.byte()?)?,
+                price: reader.decimal()?,
+                side: decode_side(reader.byte()?)?,
+                size: reader.decimal()?,
+                status: decode_trade_status(reader.byte()?)?,
+                taker_order_id: reader.text()?,
+                timestamp: reader.text()?,
+                transaction_hash: reader.optional_text()?,
+                role: decode_role(reader.byte()?)?,
+                event: decode_event(reader.byte()?)?,
+            };
+            validate_unsigned(&trade.timestamp)?;
+            if trade.event != PolymarketEvidenceEventV2::Trade {
+                return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+            }
+            Ok(PolymarketUserEvidenceElementV2::Trade(trade))
+        }
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_maker(
+    reader: &mut CanonicalReader<'_>,
+) -> Result<PolymarketMakerEvidenceV2, PolymarketEvidenceV2Error> {
+    Ok(PolymarketMakerEvidenceV2 {
+        asset_id: reader.text()?,
+        maker_address: reader.text()?,
+        matched_amount: reader.decimal()?,
+        order_id: reader.text()?,
+        outcome: reader.optional_text()?,
+        ownership: decode_maker_ownership(reader.byte()?)?,
+        price: reader.decimal()?,
+        side: reader.optional_side()?,
+        fee_rate_bps: reader.optional_decimal()?,
+    })
+}
+
+fn decode_side(value: u8) -> Result<PolymarketEvidenceSideV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceSideV2::Buy),
+        2 => Ok(PolymarketEvidenceSideV2::Sell),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_role(value: u8) -> Result<PolymarketEvidenceRoleV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceRoleV2::Maker),
+        2 => Ok(PolymarketEvidenceRoleV2::Taker),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_event(value: u8) -> Result<PolymarketEvidenceEventV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceEventV2::Placement),
+        2 => Ok(PolymarketEvidenceEventV2::Update),
+        3 => Ok(PolymarketEvidenceEventV2::Cancellation),
+        4 => Ok(PolymarketEvidenceEventV2::Trade),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_order_type(
+    value: u8,
+) -> Result<PolymarketEvidenceOrderTypeV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceOrderTypeV2::Fok),
+        2 => Ok(PolymarketEvidenceOrderTypeV2::Fak),
+        3 => Ok(PolymarketEvidenceOrderTypeV2::Gtc),
+        4 => Ok(PolymarketEvidenceOrderTypeV2::Gtd),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_order_status(
+    value: u8,
+) -> Result<PolymarketEvidenceOrderStatusV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceOrderStatusV2::Invalid),
+        2 => Ok(PolymarketEvidenceOrderStatusV2::Live),
+        3 => Ok(PolymarketEvidenceOrderStatusV2::Delayed),
+        4 => Ok(PolymarketEvidenceOrderStatusV2::Matched),
+        5 => Ok(PolymarketEvidenceOrderStatusV2::Unmatched),
+        6 => Ok(PolymarketEvidenceOrderStatusV2::Canceled),
+        7 => Ok(PolymarketEvidenceOrderStatusV2::CanceledMarketResolved),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_trade_status(
+    value: u8,
+) -> Result<PolymarketEvidenceTradeStatusV2, PolymarketEvidenceV2Error> {
+    match value {
+        1 => Ok(PolymarketEvidenceTradeStatusV2::MatchedNotBroadcasted),
+        2 => Ok(PolymarketEvidenceTradeStatusV2::Matched),
+        3 => Ok(PolymarketEvidenceTradeStatusV2::Mined),
+        4 => Ok(PolymarketEvidenceTradeStatusV2::Confirmed),
+        5 => Ok(PolymarketEvidenceTradeStatusV2::Retrying),
+        6 => Ok(PolymarketEvidenceTradeStatusV2::Failed),
+        _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+    }
+}
+
+fn decode_order_ownership(
+    value: u8,
+) -> Result<PolymarketOrderOwnershipV2, PolymarketEvidenceV2Error> {
+    if value & !0b111 != 0 {
+        return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+    }
+    Ok(PolymarketOrderOwnershipV2 {
+        maker_address_matches_account: value & 1 != 0,
+        owner_matches_api_key: value & 2 != 0,
+        order_owner_matches_api_key: value & 4 != 0,
+    })
+}
+
+fn decode_trade_ownership(
+    value: u8,
+) -> Result<PolymarketTradeOwnershipV2, PolymarketEvidenceV2Error> {
+    if value & !0b111 != 0 {
+        return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+    }
+    Ok(PolymarketTradeOwnershipV2 {
+        maker_address_matches_account: value & 1 != 0,
+        owner_matches_api_key: value & 2 != 0,
+        trade_owner_matches_api_key: value & 4 != 0,
+    })
+}
+
+fn decode_maker_ownership(
+    value: u8,
+) -> Result<PolymarketMakerOwnershipV2, PolymarketEvidenceV2Error> {
+    if value & !0b11 != 0 {
+        return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+    }
+    Ok(PolymarketMakerOwnershipV2 {
+        maker_address_matches_account: value & 1 != 0,
+        owner_matches_api_key: value & 2 != 0,
+    })
+}
+
+struct CanonicalReader<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CanonicalReader<'a> {
+    const fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], PolymarketEvidenceV2Error> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(PolymarketEvidenceV2Error::Capacity)?;
+        let value = self
+            .input
+            .get(self.offset..end)
+            .ok_or(PolymarketEvidenceV2Error::InvalidEncoding)?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn byte(&mut self) -> Result<u8, PolymarketEvidenceV2Error> {
+        self.take(1)?
+            .first()
+            .copied()
+            .ok_or(PolymarketEvidenceV2Error::InvalidEncoding)
+    }
+
+    fn u16(&mut self) -> Result<u16, PolymarketEvidenceV2Error> {
+        Ok(u16::from_be_bytes(
+            self.take(2)?
+                .try_into()
+                .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)?,
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, PolymarketEvidenceV2Error> {
+        Ok(u64::from_be_bytes(
+            self.take(8)?
+                .try_into()
+                .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)?,
+        ))
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], PolymarketEvidenceV2Error> {
+        self.take(N)?
+            .try_into()
+            .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)
+    }
+
+    fn text(&mut self) -> Result<String, PolymarketEvidenceV2Error> {
+        let length = usize::from(self.u16()?);
+        let value = std::str::from_utf8(self.take(length)?)
+            .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)?;
+        validate_text(value)?;
+        Ok(value.to_owned())
+    }
+
+    fn texts(&mut self) -> Result<Vec<String>, PolymarketEvidenceV2Error> {
+        let count = usize::from(self.u16()?);
+        if count > MAX_NESTED {
+            return Err(PolymarketEvidenceV2Error::Capacity);
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| PolymarketEvidenceV2Error::Capacity)?;
+        for _ in 0..count {
+            values.push(self.text()?);
+        }
+        Ok(values)
+    }
+
+    fn optional_text(&mut self) -> Result<Option<String>, PolymarketEvidenceV2Error> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => self.text().map(Some),
+            _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+        }
+    }
+
+    fn decimal(&mut self) -> Result<PolymarketWireDecimalV2, PolymarketEvidenceV2Error> {
+        let mantissa = u128::from_be_bytes(
+            self.take(16)?
+                .try_into()
+                .map_err(|_| PolymarketEvidenceV2Error::InvalidEncoding)?,
+        );
+        let scale = self.byte()?;
+        if scale > 38 || (mantissa == 0 && scale != 0) || (scale > 0 && mantissa.is_multiple_of(10))
+        {
+            return Err(PolymarketEvidenceV2Error::InvalidEncoding);
+        }
+        Ok(PolymarketWireDecimalV2 { mantissa, scale })
+    }
+
+    fn optional_decimal(
+        &mut self,
+    ) -> Result<Option<PolymarketWireDecimalV2>, PolymarketEvidenceV2Error> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => self.decimal().map(Some),
+            _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+        }
+    }
+
+    fn optional_side(
+        &mut self,
+    ) -> Result<Option<PolymarketEvidenceSideV2>, PolymarketEvidenceV2Error> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => decode_side(self.byte()?).map(Some),
+            _ => Err(PolymarketEvidenceV2Error::InvalidEncoding),
+        }
+    }
+
+    fn finish(self) -> Result<(), PolymarketEvidenceV2Error> {
+        if self.offset == self.input.len() {
+            Ok(())
+        } else {
+            Err(PolymarketEvidenceV2Error::InvalidEncoding)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,6 +1740,10 @@ mod tests {
         assert_eq!(single.envelope(), PolymarketEvidenceEnvelopeV2::Single);
         assert_eq!(single.elements().len(), 1);
         assert_eq!(
+            PolymarketAuthenticatedUserFrameV2::try_restore(single.canonical_bytes()).unwrap(),
+            single
+        );
+        assert_eq!(
             single.fact_id(),
             &[
                 208, 16, 62, 208, 126, 214, 240, 51, 235, 129, 230, 162, 65, 237, 50, 45, 100, 84,
@@ -1152,6 +1767,16 @@ mod tests {
                 .any(|window| window == API_KEY.as_bytes())
         );
         assert!(!format!("{batch:?}").contains(API_KEY));
+        let restored =
+            PolymarketAuthenticatedUserFrameV2::try_restore(batch.canonical_bytes()).unwrap();
+        assert_eq!(restored, batch);
+        assert_eq!(
+            restored.to_dispatch_messages(),
+            batch.to_dispatch_messages()
+        );
+        let mut tampered = batch.canonical_bytes().to_vec();
+        tampered[0] ^= 1;
+        assert!(PolymarketAuthenticatedUserFrameV2::try_restore(&tampered).is_err());
     }
 
     #[test]
@@ -1215,6 +1840,18 @@ mod tests {
             PolymarketAuthenticatedUserFrameV2::project(&malformed, 3, 2, ACCOUNT, API_KEY)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn lifecycle_compatibility_rejects_v2_decimal_outside_rust_decimal_range() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fixture("ws_user_trade_msg.json")).unwrap();
+        value["size"] = serde_json::json!("123456789012345678901234567890");
+        let raw = serde_json::to_string(&value).unwrap();
+        let frame =
+            PolymarketAuthenticatedUserFrameV2::project(&raw, 4, 1, ACCOUNT, API_KEY).unwrap();
+
+        assert!(frame.to_dispatch_messages().is_err());
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub(crate) struct WsDispatchState {
     /// Re-emitted after a fill to restore terminal state when fills race
     /// ahead of (or arrive after) cancel messages.
     terminal_cancel_reports: FifoCacheMap<VenueOrderId, OrderStatusReport, 10_000>,
+    unknown_instrument: bool,
 }
 
 impl WsDispatchState {
@@ -94,6 +95,10 @@ impl WsDispatchState {
         self.processed_fills.add(key.clone());
         self.matched_fills.remove(&key);
         self.voided_trades.add(key);
+    }
+
+    pub(crate) fn take_unknown_instrument(&mut self) -> bool {
+        std::mem::take(&mut self.unknown_instrument)
     }
 }
 
@@ -153,6 +158,7 @@ fn dispatch_order_update(
         Some(i) => i,
         None => {
             log::warn!("Unknown asset_id in order update: {}", order.asset_id);
+            state.unknown_instrument = true;
             return;
         }
     };
@@ -358,6 +364,15 @@ fn dispatch_trade_update(
     state: &mut WsDispatchState,
 ) -> Option<AccountRefreshRequest> {
     let dedup_key = format!("{}-{}", trade.id, trade.taker_order_id);
+    if has_unknown_trade_instrument(trade, ctx) {
+        log::warn!(
+            "Deferring trade {} until its instrument is available",
+            trade.id
+        );
+        state.unknown_instrument = true;
+        return None;
+    }
+
     if trade.status == PolymarketTradeStatus::Failed {
         void_failed_trade(trade, dedup_key, ctx, state);
         return Some(AccountRefreshRequest);
@@ -368,14 +383,6 @@ fn dispatch_trade_update(
         PolymarketTradeStatus::Mined | PolymarketTradeStatus::Retrying
     ) {
         log::debug!("Waiting for terminal trade status: {}", trade.id);
-        return None;
-    }
-
-    if has_unknown_trade_instrument(trade, ctx) {
-        log::warn!(
-            "Deferring trade {} until its instrument is available",
-            trade.id
-        );
         return None;
     }
 
@@ -913,13 +920,20 @@ fn emit_order_fill_voided(
         .send_order_event(OrderEventAny::FillVoided(voided));
 }
 
-/// Flattens a user trade into a string map of venue fill metadata for `OrderFilled.info`.
+/// Flattens credential-free user-trade metadata for `OrderFilled.info`.
 ///
-/// Mirrors the v1 adapter, which attaches the full raw trade to each fill it generates. Scalar
-/// fields map to their string form; nested fields (such as `maker_orders`) become their JSON text.
+/// API-key identity fields are transient authentication inputs and are removed from the outer
+/// trade and every nested maker row before any normalized Nautilus event can retain them.
 fn trade_fill_info(trade: &PolymarketUserTrade) -> Option<IndexMap<Ustr, Ustr>> {
-    let value = serde_json::to_value(trade).ok()?;
-    let object = value.as_object()?;
+    let mut value = serde_json::to_value(trade).ok()?;
+    let object = value.as_object_mut()?;
+    object.remove("owner");
+    object.remove("trade_owner");
+    if let Some(serde_json::Value::Array(makers)) = object.get_mut("maker_orders") {
+        for maker in makers {
+            maker.as_object_mut()?.remove("owner");
+        }
+    }
     let mut info = IndexMap::with_capacity(object.len());
     for (key, val) in object {
         let val_str = match val {
@@ -1189,8 +1203,10 @@ mod tests {
 
         let info = trade_fill_info(&trade).expect("info should be present");
 
-        // Every raw trade field is captured (mirrors v1 info=msg.to_dict()).
-        assert_eq!(info.len(), 21);
+        // Every non-credential trade field is retained.
+        assert_eq!(info.len(), 19);
+        assert!(!info.contains_key(&Ustr::from("owner")));
+        assert!(!info.contains_key(&Ustr::from("trade_owner")));
         assert_eq!(info[&Ustr::from("id")], Ustr::from("trade-0xabcdef1234"));
         assert_eq!(info[&Ustr::from("fee_rate_bps")], Ustr::from("0"));
         assert_eq!(
@@ -1210,6 +1226,7 @@ mod tests {
         let maker_orders = info[&Ustr::from("maker_orders")].as_str();
         assert!(maker_orders.starts_with('['));
         assert!(maker_orders.contains("order_id"));
+        assert!(!maker_orders.contains("owner"));
 
         let empty_hash_trade: PolymarketUserTrade = load("ws_user_trade_msg.json");
         let empty_hash_info =
@@ -1365,12 +1382,49 @@ mod tests {
 
         let first_result =
             dispatch_user_message(&UserWsMessage::Trade(trade.clone()), &ctx, &mut state);
+        assert!(state.take_unknown_instrument());
         token_instruments.insert(trade.asset_id, instrument);
         let replay_result = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
 
         assert!(first_result.is_none());
         assert!(replay_result.is_some());
         assert_eq!(fill_tracker.pending_fills_for(&venue_order_id).len(), 1);
+    }
+
+    #[rstest]
+    #[case(crate::common::enums::PolymarketTradeStatus::MatchedNotBroadcasted)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Matched)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Mined)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Confirmed)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Retrying)]
+    #[case(crate::common::enums::PolymarketTradeStatus::Failed)]
+    fn every_unknown_instrument_trade_status_sets_fail_closed_signal(
+        #[case] status: crate::common::enums::PolymarketTradeStatus,
+    ) {
+        let mut trade: PolymarketUserTrade = load("ws_user_trade.json");
+        trade.status = status;
+        let token_instruments = AtomicMap::new();
+        let fill_tracker = OrderFillTrackerMap::new();
+        let pending_submits = PendingSubmitTracker::default();
+        let order_identities = OrderIdentityRegistry::default();
+        let emitter = test_emitter();
+        let ctx = WsDispatchContext {
+            token_instruments: &token_instruments,
+            fill_tracker: &fill_tracker,
+            pending_submits: &pending_submits,
+            order_identities: &order_identities,
+            emitter: &emitter,
+            account_id: AccountId::from("POLY-001"),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+            user_address: "0xtest",
+            user_api_key: "test-key",
+        };
+        let mut state = WsDispatchState::default();
+
+        let result = dispatch_user_message(&UserWsMessage::Trade(trade), &ctx, &mut state);
+
+        assert!(result.is_none());
+        assert!(state.take_unknown_instrument());
     }
 
     #[rstest]

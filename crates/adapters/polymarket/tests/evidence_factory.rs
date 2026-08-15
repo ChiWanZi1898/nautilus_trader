@@ -20,9 +20,10 @@ use async_trait::async_trait;
 use nautilus_common::factories::ExecutionClientFactory;
 use nautilus_polymarket::{
     evidence::{
-        PolymarketAuthenticatedUserFrame, PolymarketEvidenceAck, PolymarketEvidenceBridge,
-        PolymarketEvidenceError, PolymarketEvidenceRecovery, PolymarketMutationEvidence,
+        PolymarketEvidenceAck, PolymarketEvidenceBridge, PolymarketEvidenceError,
+        PolymarketEvidenceRecovery, PolymarketMutationEvidence,
     },
+    evidence_v2::PolymarketAuthenticatedUserFrameV2,
     factories::PolymarketEvidenceExecutionClientFactory,
 };
 
@@ -52,7 +53,7 @@ impl PolymarketEvidenceBridge for ExternalEvidenceBridge {
 
     async fn append_authenticated_user_frame(
         &self,
-        _fact: &PolymarketAuthenticatedUserFrame,
+        _fact: &PolymarketAuthenticatedUserFrameV2,
     ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
         Err(PolymarketEvidenceError::Unavailable)
     }

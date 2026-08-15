@@ -52,12 +52,13 @@ use crate::{
     evidence::{
         PolymarketEvidenceRecovery, PolymarketRecoveredMutationFact, PolymarketSignedLimitEvidence,
     },
+    evidence_v2::dispatch_api_key_marker,
     execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
     signing::eip712::recover_order_signer,
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
-        messages::{PolymarketWsMessage, UserWsMessage},
+        messages::PolymarketWsMessage,
     },
 };
 
@@ -258,6 +259,7 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) async fn start_ws_stream(&mut self) -> anyhow::Result<()> {
+        self.user_stream_healthy.store(true, Ordering::Release);
         self.ws_client
             .connect()
             .await
@@ -280,12 +282,19 @@ impl PolymarketExecutionClient {
         let clock = self.clock;
         let signature_type = self.config.signature_type;
         let stopping = self.stopping.clone();
+        let heartbeat_healthy = self.heartbeat_healthy.clone();
+        let user_stream_healthy = self.user_stream_healthy.clone();
+        let strict_evidence_dispatch = self.evidence_bridge.is_some();
         let user_address = self
             .secrets
             .funder
             .clone()
             .unwrap_or_else(|| self.secrets.address.clone());
-        let user_api_key = self.secrets.credential.api_key().to_string();
+        let user_api_key = if self.evidence_bridge.is_some() {
+            dispatch_api_key_marker().to_owned()
+        } else {
+            self.secrets.credential.api_key().to_string()
+        };
 
         let fill_tracker = self.fill_tracker.clone();
         let pending_submits = self.pending_submits.clone();
@@ -308,10 +317,21 @@ impl PolymarketExecutionClient {
             loop {
                 match rx.recv().await {
                     Some(PolymarketWsMessage::User(user_msg)) => {
-                        let refresh = {
+                        let (refresh, unknown_instrument) = {
                             let mut state = ws_dispatch_state.lock().expect(MUTEX_POISONED);
-                            dispatch_user_message(&user_msg, &ctx, &mut state)
+                            let refresh = dispatch_user_message(&user_msg, &ctx, &mut state);
+                            (refresh, state.take_unknown_instrument())
                         };
+
+                        if strict_evidence_dispatch && unknown_instrument {
+                            log::error!(
+                                "Durable Polymarket user evidence references an unknown instrument"
+                            );
+                            heartbeat_healthy.store(false, Ordering::Release);
+                            user_stream_healthy.store(false, Ordering::Release);
+                            stopping.store(true, Ordering::Release);
+                            break;
+                        }
 
                         if refresh.is_some() {
                             let http = http_client.clone();
@@ -363,6 +383,7 @@ impl PolymarketExecutionClient {
                 }
             }
 
+            user_stream_healthy.store(false, Ordering::Release);
             log::debug!("User WebSocket handler task completed");
         });
 
@@ -478,6 +499,16 @@ impl PolymarketExecutionClient {
 
         self.restore_ambiguous_mutations(&recovery)?;
         self.replay_authenticated_user_frames(&recovery)?;
+        let recovered_epoch = recovery
+            .user_frames()
+            .last()
+            .map_or(0, |record| record.frame().session_epoch());
+        self.ws_client
+            .seed_recovered_user_session_epoch(recovered_epoch)
+            .context("failed to seed recovered Polymarket user session epoch")?;
+        self.ws_client
+            .seed_recovered_user_evidence_sequence(recovery.inbound_high_watermark())
+            .context("failed to seed recovered Polymarket user evidence sequence")?;
         self.evidence_bridge
             .as_ref()
             .context("recovered evidence has no durability bridge")?
@@ -621,7 +652,7 @@ impl PolymarketExecutionClient {
             .funder
             .as_deref()
             .unwrap_or(self.secrets.address.as_str());
-        let user_api_key = self.secrets.credential.api_key().to_string();
+        let user_api_key = dispatch_api_key_marker();
         let ctx = WsDispatchContext {
             token_instruments: &self.shared_token_instruments,
             fill_tracker: &self.fill_tracker,
@@ -631,17 +662,21 @@ impl PolymarketExecutionClient {
             account_id: self.core.account_id,
             clock: self.clock,
             user_address,
-            user_api_key: &user_api_key,
+            user_api_key,
         };
         let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
         for record in recovery.user_frames() {
-            let text = std::str::from_utf8(record.frame().raw_utf8())
-                .context("recovered authenticated user frame is not UTF-8")?;
-            let messages = UserWsMessage::parse_batch(text)
-                .or_else(|_| UserWsMessage::parse(text).map(|message| vec![message]))
-                .context("recovered authenticated user frame cannot be parsed")?;
+            let messages = record
+                .frame()
+                .to_dispatch_messages()
+                .context("recovered authenticated user frame cannot be normalized")?;
             for message in messages {
                 let _ = dispatch_user_message(&message, &ctx, &mut state);
+                if state.take_unknown_instrument() {
+                    anyhow::bail!(
+                        "recovered authenticated user evidence references an unknown instrument"
+                    );
+                }
             }
         }
         Ok(())

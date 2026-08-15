@@ -122,7 +122,9 @@ pub struct PolymarketWebSocketClient {
     transport_backend: TransportBackend,
     proxy_url: Option<ProxyUrl>,
     evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+    evidence_account_address: Option<String>,
     user_session_epoch: Arc<AtomicU64>,
+    user_evidence_sequence: Arc<AtomicU64>,
 }
 
 impl PolymarketWebSocketClient {
@@ -196,6 +198,7 @@ impl PolymarketWebSocketClient {
         transport_backend: TransportBackend,
         proxy_url: Option<ProxyUrl>,
         evidence_bridge: Arc<dyn PolymarketEvidenceBridge>,
+        account_address: String,
     ) -> Self {
         let url = base_url.unwrap_or_else(|| clob_ws_user_url().to_string());
         Self::new_inner(
@@ -205,7 +208,7 @@ impl PolymarketWebSocketClient {
             false,
             transport_backend,
             proxy_url,
-            Some(evidence_bridge),
+            Some((evidence_bridge, account_address)),
         )
     }
 
@@ -216,9 +219,13 @@ impl PolymarketWebSocketClient {
         subscribe_new_markets: bool,
         transport_backend: TransportBackend,
         proxy_url: Option<ProxyUrl>,
-        evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+        evidence: Option<(Arc<dyn PolymarketEvidenceBridge>, String)>,
     ) -> Self {
         let (placeholder_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (evidence_bridge, evidence_account_address) = evidence
+            .map_or((None, None), |(bridge, account_address)| {
+                (Some(bridge), Some(account_address))
+            });
         Self {
             channel,
             url,
@@ -235,8 +242,43 @@ impl PolymarketWebSocketClient {
             transport_backend,
             proxy_url,
             evidence_bridge,
+            evidence_account_address,
             user_session_epoch: Arc::new(AtomicU64::new(0)),
+            user_evidence_sequence: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn seed_recovered_user_session_epoch(
+        &self,
+        recovered_epoch: u64,
+    ) -> anyhow::Result<()> {
+        if self.channel != WsChannel::User
+            || self.evidence_bridge.is_none()
+            || ConnectionMode::from_atomic(&self.connection_mode).is_active()
+            || recovered_epoch == u64::MAX
+        {
+            anyhow::bail!("invalid recovered Polymarket user session epoch");
+        }
+        self.user_session_epoch
+            .compare_exchange(0, recovered_epoch, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| anyhow::anyhow!("Polymarket user session epoch was already seeded"))?;
+        Ok(())
+    }
+
+    pub(crate) fn seed_recovered_user_evidence_sequence(
+        &self,
+        recovered_sequence: u64,
+    ) -> anyhow::Result<()> {
+        if self.channel != WsChannel::User
+            || self.evidence_bridge.is_none()
+            || ConnectionMode::from_atomic(&self.connection_mode).is_active()
+        {
+            anyhow::bail!("invalid recovered Polymarket user evidence sequence");
+        }
+        self.user_evidence_sequence
+            .compare_exchange(0, recovered_sequence, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| anyhow::anyhow!("Polymarket user evidence sequence was already seeded"))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -310,7 +352,9 @@ impl PolymarketWebSocketClient {
         let user_subscribed = self.user_subscribed.load(Ordering::Relaxed);
         let subscribe_new_markets = self.subscribe_new_markets;
         let evidence_bridge = self.evidence_bridge.clone();
+        let evidence_account_address = self.evidence_account_address.clone();
         let user_session_epoch = self.user_session_epoch.clone();
+        let user_evidence_sequence = self.user_evidence_sequence.clone();
         let session_epoch = if channel == WsChannel::User {
             user_session_epoch
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -335,7 +379,9 @@ impl PolymarketWebSocketClient {
                 user_subscribed,
                 subscribe_new_markets,
                 evidence_bridge,
+                evidence_account_address,
                 user_session_epoch,
+                user_evidence_sequence,
                 session_epoch,
             );
 
@@ -575,8 +621,12 @@ impl PolymarketWebSocketClient {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, atomic::Ordering},
+    };
 
+    use async_trait::async_trait;
     use axum::{
         Router,
         extract::ws::{Message as AxumWsMessage, WebSocket, WebSocketUpgrade},
@@ -590,9 +640,69 @@ mod tests {
     use rstest::rstest;
 
     use super::{PolymarketWebSocketClient, WsChannel, idle_timeout_ms_for};
+    use crate::{
+        common::credential::Credential,
+        evidence::{
+            PolymarketEvidenceAck, PolymarketEvidenceBridge, PolymarketEvidenceError,
+            PolymarketEvidenceRecovery, PolymarketMutationEvidence,
+        },
+        evidence_v2::PolymarketAuthenticatedUserFrameV2,
+    };
+
+    #[derive(Debug)]
+    struct TestEvidenceBridge;
+
+    #[async_trait]
+    impl PolymarketEvidenceBridge for TestEvidenceBridge {
+        fn recover(&self) -> Result<PolymarketEvidenceRecovery, PolymarketEvidenceError> {
+            PolymarketEvidenceRecovery::try_new([0x51; 32], 0, 0, Vec::new(), Vec::new())
+        }
+
+        fn acknowledge_recovery(
+            &self,
+            _mutation_high_watermark: u64,
+            _inbound_high_watermark: u64,
+        ) -> Result<(), PolymarketEvidenceError> {
+            Ok(())
+        }
+
+        async fn append_mutation(
+            &self,
+            _fact: &PolymarketMutationEvidence<'_>,
+        ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+            Err(PolymarketEvidenceError::Unavailable)
+        }
+
+        async fn append_authenticated_user_frame(
+            &self,
+            _fact: &PolymarketAuthenticatedUserFrameV2,
+        ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError> {
+            Err(PolymarketEvidenceError::Unavailable)
+        }
+    }
+
+    fn evidence_user_client() -> PolymarketWebSocketClient {
+        PolymarketWebSocketClient::new_user_with_proxy_and_evidence(
+            Some("ws://user.example/ws".to_owned()),
+            Credential::new(
+                "fixture-key",
+                "Zml4dHVyZQ==",
+                "fixture-passphrase".to_owned(),
+            )
+            .unwrap(),
+            TransportBackend::Tungstenite,
+            None,
+            Arc::new(TestEvidenceBridge),
+            "0xaccount".to_owned(),
+        )
+    }
 
     async fn handle_upgrade(ws: WebSocketUpgrade) -> Response {
         ws.on_upgrade(handle_socket)
+    }
+
+    async fn handle_idle_upgrade(ws: WebSocketUpgrade) -> Response {
+        ws.on_upgrade(|mut socket| async move { while socket.recv().await.is_some() {} })
     }
 
     async fn handle_socket(mut socket: WebSocket) {
@@ -618,11 +728,69 @@ mod tests {
         addr
     }
 
+    async fn start_idle_test_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind idle test websocket server");
+        let addr = listener.local_addr().expect("idle test websocket address");
+        let router = Router::new().route("/ws", get(handle_idle_upgrade));
+
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("idle test websocket server failed");
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        addr
+    }
+
     #[rstest]
     #[case::market(WsChannel::Market, 60_000)]
     #[case::user(WsChannel::User, 300_000)]
     fn test_idle_timeout_ms_for_channel(#[case] channel: WsChannel, #[case] expected: u64) {
         assert_eq!(idle_timeout_ms_for(channel), expected);
+    }
+
+    #[test]
+    fn recovered_user_epoch_is_seeded_exactly_once_before_connect() {
+        let client = evidence_user_client();
+        client.seed_recovered_user_session_epoch(9).unwrap();
+        client.seed_recovered_user_evidence_sequence(17).unwrap();
+        assert_eq!(client.user_session_epoch.load(Ordering::SeqCst), 9);
+        assert_eq!(client.user_evidence_sequence.load(Ordering::SeqCst), 17);
+        assert!(client.seed_recovered_user_session_epoch(9).is_err());
+        assert!(client.seed_recovered_user_evidence_sequence(17).is_err());
+
+        let overflow = evidence_user_client();
+        assert!(
+            overflow
+                .seed_recovered_user_session_epoch(u64::MAX)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_connect_advances_once_from_recovered_user_epoch() {
+        let addr = start_idle_test_server().await;
+        let mut client = PolymarketWebSocketClient::new_user_with_proxy_and_evidence(
+            Some(format!("ws://{addr}/ws")),
+            Credential::new(
+                "fixture-key",
+                "Zml4dHVyZQ==",
+                "fixture-passphrase".to_owned(),
+            )
+            .unwrap(),
+            TransportBackend::Tungstenite,
+            None,
+            Arc::new(TestEvidenceBridge),
+            "0xaccount".to_owned(),
+        );
+        client.seed_recovered_user_session_epoch(9).unwrap();
+
+        client.connect().await.unwrap();
+        assert_eq!(client.user_session_epoch.load(Ordering::SeqCst), 10);
+        client.disconnect().await.unwrap();
     }
 
     #[rstest]

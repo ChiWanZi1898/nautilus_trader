@@ -20,11 +20,11 @@ use aws_lc_rs::digest;
 use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
 
 use crate::{
-    common::enums::PolymarketOrderType, http::models::PolymarketOrder, signing::eip712::order_hash,
+    common::enums::PolymarketOrderType, evidence_v2::PolymarketAuthenticatedUserFrameV2,
+    http::models::PolymarketOrder, signing::eip712::order_hash,
 };
 
 const PREPARED_ID_DOMAIN: &[u8] = b"nautilus-polymarket/submit-prepared/v1\0";
-const USER_FRAME_ID_DOMAIN: &[u8] = b"nautilus-polymarket/authenticated-user-frame/v1\0";
 
 /// Single or batch HTTP endpoint selected for one prepared mutation group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -277,88 +277,6 @@ pub enum PolymarketMutationEvidence<'a> {
     HandoffStarted(PolymarketHandoffStarted),
 }
 
-/// Exact authenticated user-channel text frame retained before any element is
-/// released to normalized order lifecycle dispatch.
-#[derive(Clone, Eq, PartialEq)]
-pub struct PolymarketAuthenticatedUserFrame {
-    fact_id: [u8; 32],
-    session_epoch: u64,
-    frame_sequence: u64,
-    raw_utf8: Arc<[u8]>,
-}
-
-impl Debug for PolymarketAuthenticatedUserFrame {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("PolymarketAuthenticatedUserFrame")
-            .field("fact_id", &self.fact_id)
-            .field("session_epoch", &self.session_epoch)
-            .field("frame_sequence", &self.frame_sequence)
-            .field("raw_len", &self.raw_utf8.len())
-            .finish()
-    }
-}
-
-impl PolymarketAuthenticatedUserFrame {
-    #[must_use]
-    pub const fn fact_id(&self) -> &[u8; 32] {
-        &self.fact_id
-    }
-
-    #[must_use]
-    pub const fn session_epoch(&self) -> u64 {
-        self.session_epoch
-    }
-
-    #[must_use]
-    pub const fn frame_sequence(&self) -> u64 {
-        self.frame_sequence
-    }
-
-    #[must_use]
-    pub fn raw_utf8(&self) -> &[u8] {
-        &self.raw_utf8
-    }
-
-    pub(crate) fn try_new(
-        session_epoch: u64,
-        frame_sequence: u64,
-        raw_utf8: &[u8],
-    ) -> Result<Self, PolymarketEvidenceError> {
-        if session_epoch == 0 || frame_sequence == 0 || raw_utf8.is_empty() {
-            return Err(PolymarketEvidenceError::InvalidFact);
-        }
-        let mut input = Vec::new();
-        input.extend_from_slice(USER_FRAME_ID_DOMAIN);
-        input.extend_from_slice(&session_epoch.to_be_bytes());
-        input.extend_from_slice(&frame_sequence.to_be_bytes());
-        input.extend_from_slice(raw_utf8);
-        let fact_id = digest::digest(&digest::SHA256, &input)
-            .as_ref()
-            .try_into()
-            .map_err(|_| PolymarketEvidenceError::InvalidFact)?;
-        Ok(Self {
-            fact_id,
-            session_epoch,
-            frame_sequence,
-            raw_utf8: Arc::from(raw_utf8),
-        })
-    }
-
-    /// Restores and rehashes one exact authenticated frame.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for zero counters or an empty frame.
-    pub fn try_restore(
-        session_epoch: u64,
-        frame_sequence: u64,
-        raw_utf8: &[u8],
-    ) -> Result<Self, PolymarketEvidenceError> {
-        Self::try_new(session_epoch, frame_sequence, raw_utf8)
-    }
-}
-
 /// One owned mutation WAL record in its independent durable sequence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolymarketRecoveredMutation {
@@ -407,7 +325,7 @@ pub enum PolymarketRecoveredMutationFact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PolymarketRecoveredUserFrame {
     evidence_sequence: u64,
-    frame: PolymarketAuthenticatedUserFrame,
+    frame: PolymarketAuthenticatedUserFrameV2,
 }
 
 impl PolymarketRecoveredUserFrame {
@@ -418,7 +336,7 @@ impl PolymarketRecoveredUserFrame {
     /// Returns an error for the reserved zero evidence sequence.
     pub fn try_new(
         evidence_sequence: u64,
-        frame: PolymarketAuthenticatedUserFrame,
+        frame: PolymarketAuthenticatedUserFrameV2,
     ) -> Result<Self, PolymarketEvidenceError> {
         if evidence_sequence == 0 {
             return Err(PolymarketEvidenceError::Recovery);
@@ -435,7 +353,7 @@ impl PolymarketRecoveredUserFrame {
     }
 
     #[must_use]
-    pub const fn frame(&self) -> &PolymarketAuthenticatedUserFrame {
+    pub const fn frame(&self) -> &PolymarketAuthenticatedUserFrameV2 {
         &self.frame
     }
 }
@@ -630,7 +548,7 @@ pub trait PolymarketEvidenceBridge: Debug + Send + Sync {
     /// Appends one exact authenticated user frame before normalized dispatch.
     async fn append_authenticated_user_frame(
         &self,
-        fact: &PolymarketAuthenticatedUserFrame,
+        fact: &PolymarketAuthenticatedUserFrameV2,
     ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError>;
 }
 
@@ -668,10 +586,12 @@ mod tests {
     ) -> PolymarketRecoveredUserFrame {
         PolymarketRecoveredUserFrame::try_new(
             evidence_sequence,
-            PolymarketAuthenticatedUserFrame::try_restore(
+            PolymarketAuthenticatedUserFrameV2::project(
+                include_str!("../test_data/ws_user_order_msg.json"),
                 session_epoch,
                 frame_sequence,
-                br#"{"event_type":"order"}"#,
+                "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+                "00000000-0000-0000-0000-000000000001",
             )
             .unwrap(),
         )
