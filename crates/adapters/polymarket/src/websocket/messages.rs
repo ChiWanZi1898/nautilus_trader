@@ -504,6 +504,13 @@ pub enum PolymarketWsMessage {
     Reconnected,
 }
 
+/// One parsed WebSocket message bound to the exact transport connection epoch that carried it.
+#[derive(Debug)]
+pub(crate) struct PolymarketConnectionMessage {
+    pub(crate) transport_epoch: u64,
+    pub(crate) message: PolymarketWsMessage,
+}
+
 /// Auth payload embedded in user-channel subscribe messages.
 #[derive(Debug, Serialize)]
 pub struct PolymarketWsAuth {

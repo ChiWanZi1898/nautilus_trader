@@ -26,7 +26,7 @@ use nautilus_model::events::PositionEvent;
 
 use super::{
     PolymarketDataClient,
-    dispatch::{WsMessageContext, handle_ws_message},
+    dispatch::{WsMessageContext, handle_market_pool_event},
     runtime::{retire_expired_local_instruments, seed_token_meta_from_live_instruments},
 };
 use crate::{
@@ -36,7 +36,7 @@ use crate::{
         fetch_and_apply_resolutions_by_condition_ids, pause_resolve_watch_entries,
         update_resolve_watchlist_from_position_event,
     },
-    websocket::messages::PolymarketWsMessage,
+    websocket::pool::PolymarketMarketPoolEvent,
 };
 
 impl PolymarketDataClient {
@@ -63,7 +63,7 @@ impl PolymarketDataClient {
 
     fn spawn_message_handler(
         &mut self,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PolymarketMarketPoolEvent>,
     ) {
         let cancellation = self.cancellation_token.clone();
 
@@ -106,7 +106,7 @@ impl PolymarketDataClient {
                 tokio::select! {
                     maybe_msg = rx.recv() => {
                         match maybe_msg {
-                            Some(msg) => handle_ws_message(msg, &ctx),
+                            Some(event) => handle_market_pool_event(event, &ctx),
                             None => {
                                 log::debug!("WebSocket message channel closed");
                                 break;
@@ -373,7 +373,7 @@ impl PolymarketDataClient {
 
         let rx = self
             .ws_client
-            .take_message_receiver()
+            .take_pool_event_receiver()
             .ok_or_else(|| anyhow::anyhow!("WS message receiver not available after connect"))?;
 
         self.spawn_message_handler(rx);
@@ -462,7 +462,7 @@ mod tests {
             gamma::PolymarketGammaHttpClient,
         },
         resolve::upsert_resolve_watch_entry_from_instrument,
-        websocket::{messages::PolymarketWsMessage, pool::PolymarketMarketConnectionPool},
+        websocket::pool::PolymarketMarketConnectionPool,
     };
 
     fn make_client_for_reset_test() -> PolymarketDataClient {
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(!client.token_meta.contains_key(&token_id));
 
         for startup in 1..=2 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PolymarketWsMessage>();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PolymarketMarketPoolEvent>();
             drop(tx);
             client.spawn_message_handler(rx);
             client

@@ -64,8 +64,35 @@ use crate::{
             parse_book_deltas, parse_book_snapshot, parse_quote_from_price_change,
             parse_quote_from_snapshot, parse_timestamp_ms, parse_trade_tick,
         },
+        pool::PolymarketMarketPoolEvent,
     },
 };
+
+pub(super) fn handle_market_pool_event(event: PolymarketMarketPoolEvent, ctx: &WsMessageContext) {
+    match event {
+        PolymarketMarketPoolEvent::Message {
+            shard_id,
+            connection_generation,
+            message,
+        } => {
+            log::trace!(
+                "Dispatching Polymarket market shard {shard_id} generation {connection_generation}"
+            );
+            handle_ws_message(message, ctx);
+        }
+        PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+            shard_id,
+            connection_generation,
+            assigned_asset_ids,
+        } => {
+            log::info!(
+                "Polymarket market shard {shard_id} advanced to generation {connection_generation} with {} assigned assets",
+                assigned_asset_ids.len(),
+            );
+            handle_ws_message(PolymarketWsMessage::Reconnected, ctx);
+        }
+    }
+}
 
 struct NewMarketInflightGuard {
     inflight_keys: Arc<DashMap<String, ()>>,

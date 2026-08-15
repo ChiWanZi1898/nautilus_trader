@@ -272,7 +272,7 @@ impl PolymarketExecutionClient {
 
         let mut rx = self
             .ws_client
-            .take_message_receiver()
+            .take_connection_message_receiver()
             .ok_or_else(|| anyhow::anyhow!("WebSocket message receiver not available"))?;
 
         let emitter = self.emitter.clone();
@@ -315,7 +315,7 @@ impl PolymarketExecutionClient {
             };
 
             loop {
-                match rx.recv().await {
+                match rx.recv().await.map(|message| message.message) {
                     Some(PolymarketWsMessage::User(user_msg)) => {
                         let (refresh, unknown_instrument) = {
                             let mut state = ws_dispatch_state.lock().expect(MUTEX_POISONED);

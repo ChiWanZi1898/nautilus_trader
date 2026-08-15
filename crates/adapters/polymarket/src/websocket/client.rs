@@ -23,15 +23,17 @@ use std::sync::{
 use nautilus_common::live::get_runtime;
 use nautilus_network::{
     mode::ConnectionMode,
+    ratelimiter::{RateLimiter, clock::MonotonicClock},
     websocket::{
         AuthTracker, SubscriptionState, TransportBackend, WebSocketClient, WebSocketConfig,
-        channel_message_handler, proxy::ProxyUrl,
+        channel_epoch_message_handler, proxy::ProxyUrl,
     },
 };
+use ustr::Ustr;
 
 use super::{
     handler::{FeedHandler, HandlerCommand},
-    messages::PolymarketWsMessage,
+    messages::{PolymarketConnectionMessage, PolymarketWsMessage},
 };
 use crate::{
     common::{
@@ -110,7 +112,7 @@ pub struct PolymarketWebSocketClient {
     connection_mode: Arc<AtomicU8>,
     signal: Arc<AtomicBool>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
-    out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>>,
+    out_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketConnectionMessage>>,
     credential: Option<Credential>,
     subscriptions: SubscriptionState,
     auth_tracker: AuthTracker,
@@ -297,14 +299,24 @@ impl PolymarketWebSocketClient {
             return Ok(());
         }
 
-        let (message_handler, raw_rx) = channel_message_handler();
+        let (message_handler, raw_rx) = channel_epoch_message_handler();
         let cfg = self.websocket_config();
 
-        let client =
-            WebSocketClient::connect(cfg, Some(message_handler), None, None, vec![], None).await?;
+        let client = WebSocketClient::connect_with_rate_limiter_and_epoch_handler(
+            cfg,
+            message_handler,
+            None,
+            None,
+            Arc::new(RateLimiter::<Ustr, MonotonicClock>::new_with_quota(
+                None,
+                vec![],
+            )),
+        )
+        .await?;
 
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HandlerCommand>();
-        let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel::<PolymarketWsMessage>();
+        let (out_tx, out_rx) =
+            tokio::sync::mpsc::unbounded_channel::<PolymarketConnectionMessage>();
 
         *self.cmd_tx.write().await = cmd_tx.clone();
         self.out_rx = Some(out_rx);
@@ -387,10 +399,12 @@ impl PolymarketWebSocketClient {
 
             loop {
                 match handler.next().await {
-                    Some(PolymarketWsMessage::Reconnected) => {
+                    Some(message)
+                        if matches!(message.message, PolymarketWsMessage::Reconnected) =>
+                    {
                         log::info!("Polymarket WebSocket reconnected");
 
-                        if handler.send(PolymarketWsMessage::Reconnected).is_err() {
+                        if handler.send(message).is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Output channel closed, stopping handler");
                             } else {
@@ -399,8 +413,8 @@ impl PolymarketWebSocketClient {
                             break;
                         }
                     }
-                    Some(msg) => {
-                        if handler.send(msg).is_err() {
+                    Some(message) => {
+                        if handler.send(message).is_err() {
                             if handler.is_stopped() {
                                 log::debug!("Output channel closed, stopping handler");
                             } else {
@@ -600,10 +614,30 @@ impl PolymarketWebSocketClient {
     /// task that reads messages independently of the WS client.
     /// Subscription methods (`subscribe_market`, etc.) remain usable on `&self`.
     #[must_use]
+    pub(crate) fn take_connection_message_receiver(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketConnectionMessage>> {
+        self.out_rx.take()
+    }
+
+    /// Takes the public message receiver, leaving `None` in its place.
+    ///
+    /// Transport epoch metadata is retained by the adapter-internal receiver and intentionally
+    /// omitted from this compatibility API.
+    #[must_use]
     pub fn take_message_receiver(
         &mut self,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>> {
-        self.out_rx.take()
+        let mut connection_rx = self.take_connection_message_receiver()?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        get_runtime().spawn(async move {
+            while let Some(message) = connection_rx.recv().await {
+                if message_tx.send(message.message).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(message_rx)
     }
 
     /// Receives the next message from the WebSocket handler.
@@ -612,7 +646,7 @@ impl PolymarketWebSocketClient {
     /// was not yet initialized (call `connect` first).
     pub async fn next_message(&mut self) -> Option<PolymarketWsMessage> {
         if let Some(ref mut rx) = self.out_rx {
-            rx.recv().await
+            rx.recv().await.map(|message| message.message)
         } else {
             None
         }

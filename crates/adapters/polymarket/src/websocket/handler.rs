@@ -32,8 +32,8 @@ use super::{
     client::WsChannel,
     messages::{
         MarketInitialSubscribeRequest, MarketSubscribeRequest, MarketUnsubscribeRequest,
-        MarketWsMessage, PolymarketWsAuth, PolymarketWsMessage, UserSubscribeRequest,
-        UserWsMessage,
+        MarketWsMessage, PolymarketConnectionMessage, PolymarketWsAuth, PolymarketWsMessage,
+        UserSubscribeRequest, UserWsMessage,
     },
 };
 use crate::{
@@ -61,8 +61,8 @@ pub(super) struct FeedHandler {
     channel: WsChannel,
     client: Option<WebSocketClient>,
     cmd_rx: UnboundedReceiver<HandlerCommand>,
-    raw_rx: UnboundedReceiver<Message>,
-    out_tx: UnboundedSender<PolymarketWsMessage>,
+    raw_rx: UnboundedReceiver<(u64, Message)>,
+    out_tx: UnboundedSender<PolymarketConnectionMessage>,
     credential: Option<Credential>,
     subscriptions: SubscriptionState,
     auth_tracker: AuthTracker,
@@ -71,7 +71,7 @@ pub(super) struct FeedHandler {
     // True once the current market-channel session has sent its initial subscribe payload.
     market_subscription_initialized: bool,
     // Overflow buffer for batched frames, drained before reading the next raw message
-    message_buffer: Vec<PolymarketWsMessage>,
+    message_buffer: Vec<PolymarketConnectionMessage>,
     // Whether to include `custom_feature_enabled: true` in the initial subscribe
     subscribe_new_markets: bool,
     evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
@@ -88,8 +88,8 @@ impl FeedHandler {
         signal: Arc<AtomicBool>,
         channel: WsChannel,
         cmd_rx: UnboundedReceiver<HandlerCommand>,
-        raw_rx: UnboundedReceiver<Message>,
-        out_tx: UnboundedSender<PolymarketWsMessage>,
+        raw_rx: UnboundedReceiver<(u64, Message)>,
+        out_tx: UnboundedSender<PolymarketConnectionMessage>,
         credential: Option<Credential>,
         subscriptions: SubscriptionState,
         auth_tracker: AuthTracker,
@@ -124,7 +124,7 @@ impl FeedHandler {
         }
     }
 
-    pub(super) fn send(&self, msg: PolymarketWsMessage) -> Result<(), String> {
+    pub(super) fn send(&self, msg: PolymarketConnectionMessage) -> Result<(), String> {
         self.out_tx
             .send(msg)
             .map_err(|e| format!("Failed to send message: {e}"))
@@ -315,7 +315,7 @@ impl FeedHandler {
         }
     }
 
-    pub(super) async fn next(&mut self) -> Option<PolymarketWsMessage> {
+    pub(super) async fn next(&mut self) -> Option<PolymarketConnectionMessage> {
         if !self.message_buffer.is_empty() {
             return Some(self.message_buffer.remove(0));
         }
@@ -355,7 +355,7 @@ impl FeedHandler {
                         }
                     }
                 }
-                Some(raw) = self.raw_rx.recv() => {
+                Some((transport_epoch, raw)) = self.raw_rx.recv() => {
                     match raw {
                         Message::Text(text) => {
                             if text == RECONNECTED {
@@ -375,7 +375,10 @@ impl FeedHandler {
                                 }
                                 self.market_subscription_initialized = false;
                                 self.resubscribe_all().await;
-                                return Some(PolymarketWsMessage::Reconnected);
+                                return Some(PolymarketConnectionMessage {
+                                    transport_epoch,
+                                    message: PolymarketWsMessage::Reconnected,
+                                });
                             }
                             let msgs = if self.channel == WsChannel::User
                                 && let Some(bridge) = &self.evidence_bridge
@@ -458,7 +461,12 @@ impl FeedHandler {
                             }
                             // Buffer msgs[1..] so they are returned in order on subsequent
                             // next() calls; returning first directly preserves 0,1,2,...,n order
-                            let mut iter = msgs.into_iter();
+                            let mut iter = msgs.into_iter().map(|message| {
+                                PolymarketConnectionMessage {
+                                    transport_epoch,
+                                    message,
+                                }
+                            });
                             let first = iter.next().unwrap();
                             self.message_buffer.extend(iter);
                             return Some(first);
@@ -592,9 +600,35 @@ mod tests {
         )
     }
 
+    fn market_handler_with_raw() -> (FeedHandler, UnboundedSender<(u64, Message)>) {
+        let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            FeedHandler::new(
+                Arc::new(AtomicBool::new(false)),
+                WsChannel::Market,
+                cmd_rx,
+                raw_rx,
+                out_tx,
+                None,
+                SubscriptionState::new(':'),
+                AuthTracker::new(),
+                false,
+                false,
+                None,
+                None,
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+                0,
+            ),
+            raw_tx,
+        )
+    }
+
     fn user_handler_with_bridge(
         bridge: Arc<TestFrameBridge>,
-    ) -> (FeedHandler, UnboundedSender<Message>) {
+    ) -> (FeedHandler, UnboundedSender<(u64, Message)>) {
         let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
         let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -634,12 +668,15 @@ mod tests {
         let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
         let raw = include_str!("../../test_data/ws_user_batch_msg.json");
         raw_tx
-            .send(Message::Text(raw.to_string().into()))
+            .send((0, Message::Text(raw.to_string().into())))
             .expect("send raw frame");
 
         assert!(matches!(
             handler.next().await,
-            Some(PolymarketWsMessage::User(_))
+            Some(PolymarketConnectionMessage {
+                message: PolymarketWsMessage::User(_),
+                ..
+            })
         ));
         let retained = bridge.frames.lock().await;
         assert_eq!(retained.len(), 1);
@@ -651,7 +688,10 @@ mod tests {
         drop(retained);
         assert!(matches!(
             handler.next().await,
-            Some(PolymarketWsMessage::User(_))
+            Some(PolymarketConnectionMessage {
+                message: PolymarketWsMessage::User(_),
+                ..
+            })
         ));
         assert_eq!(bridge.frames.lock().await.len(), 1);
     }
@@ -663,10 +703,13 @@ mod tests {
         bridge.fail.store(true, Ordering::SeqCst);
         let (mut handler, raw_tx) = user_handler_with_bridge(bridge);
         raw_tx
-            .send(Message::Text(
-                include_str!("../../test_data/ws_user_batch_msg.json")
-                    .to_string()
-                    .into(),
+            .send((
+                0,
+                Message::Text(
+                    include_str!("../../test_data/ws_user_batch_msg.json")
+                        .to_string()
+                        .into(),
+                ),
             ))
             .expect("send raw frame");
 
@@ -682,10 +725,13 @@ mod tests {
         bridge.mismatch_ack.store(true, Ordering::SeqCst);
         let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
         raw_tx
-            .send(Message::Text(
-                include_str!("../../test_data/ws_user_batch_msg.json")
-                    .to_string()
-                    .into(),
+            .send((
+                0,
+                Message::Text(
+                    include_str!("../../test_data/ws_user_batch_msg.json")
+                        .to_string()
+                        .into(),
+                ),
             ))
             .expect("send raw frame");
 
@@ -702,10 +748,13 @@ mod tests {
         bridge.mismatch_sequence.store(true, Ordering::SeqCst);
         let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
         raw_tx
-            .send(Message::Text(
-                include_str!("../../test_data/ws_user_batch_msg.json")
-                    .to_string()
-                    .into(),
+            .send((
+                0,
+                Message::Text(
+                    include_str!("../../test_data/ws_user_batch_msg.json")
+                        .to_string()
+                        .into(),
+                ),
             ))
             .expect("send raw frame");
 
@@ -713,6 +762,27 @@ mod tests {
         assert!(handler.is_stopped());
         assert!(handler.message_buffer.is_empty());
         assert_eq!(bridge.frames.lock().await.len(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn market_batch_members_retain_the_raw_transport_epoch() {
+        let (mut handler, raw_tx) = market_handler_with_raw();
+        raw_tx
+            .send((
+                7,
+                Message::Text(
+                    include_str!("../../test_data/ws_market_mixed_known_unknown.json")
+                        .to_string()
+                        .into(),
+                ),
+            ))
+            .expect("send raw market frame");
+
+        let first = handler.next().await.expect("first parsed member");
+        let second = handler.next().await.expect("second parsed member");
+        assert_eq!(first.transport_epoch, 7);
+        assert_eq!(second.transport_epoch, 7);
     }
 
     #[rstest]

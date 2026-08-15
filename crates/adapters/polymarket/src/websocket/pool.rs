@@ -39,7 +39,7 @@ use ustr::Ustr;
 
 use super::{
     client::{PolymarketWebSocketClient, WsSubscriptionHandle},
-    messages::PolymarketWsMessage,
+    messages::{PolymarketConnectionMessage, PolymarketWsMessage},
 };
 use crate::common::consts::WS_DEFAULT_SUBSCRIPTIONS;
 
@@ -71,8 +71,8 @@ struct PoolInner {
     wire_mutex: tokio::sync::Mutex<()>,
     // Never locked across an await, so routing futures stay `Send`.
     state: StdMutex<PoolState>,
-    out_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<PolymarketWsMessage>>>,
-    out_rx: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>>>,
+    out_tx: StdMutex<Option<tokio::sync::mpsc::UnboundedSender<PolymarketMarketPoolEvent>>>,
+    out_rx: StdMutex<Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketMarketPoolEvent>>>,
     closed: AtomicBool,
 }
 
@@ -105,6 +105,24 @@ enum ReleaseOutcome {
     NotOwned,
     Unsubscribe(WsSubscriptionHandle),
     CloseShard(Box<ShardEntry>),
+}
+
+/// One market-pool output with the exact shard and adapter-local connection generation retained.
+#[derive(Debug)]
+// Keep the hot-path market message inline. Boxing it solely to equalize enum variant sizes would
+// add one heap allocation to every received market-data message.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PolymarketMarketPoolEvent {
+    Message {
+        shard_id: u64,
+        connection_generation: u64,
+        message: PolymarketWsMessage,
+    },
+    ConnectionEpochAdvanced {
+        shard_id: u64,
+        connection_generation: u64,
+        assigned_asset_ids: Vec<Ustr>,
+    },
 }
 
 #[allow(
@@ -234,14 +252,37 @@ impl PolymarketMarketConnectionPool {
 
     /// Takes the merged message receiver, leaving `None` in its place.
     #[must_use]
-    pub fn take_message_receiver(
+    pub(crate) fn take_pool_event_receiver(
         &self,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>> {
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketMarketPoolEvent>> {
         self.inner
             .out_rx
             .lock()
             .expect("pool out_rx mutex poisoned")
             .take()
+    }
+
+    /// Takes the public merged message receiver, leaving `None` in its place.
+    ///
+    /// Shard lifecycle boundaries remain adapter-internal and are omitted from this compatibility
+    /// API.
+    #[must_use]
+    pub fn take_message_receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>> {
+        let mut event_rx = self.take_pool_event_receiver()?;
+        let (message_tx, message_rx) = tokio::sync::mpsc::unbounded_channel();
+        get_runtime().spawn(async move {
+            while let Some(event) = event_rx.recv().await {
+                let PolymarketMarketPoolEvent::Message { message, .. } = event else {
+                    continue;
+                };
+                if message_tx.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        Some(message_rx)
     }
 
     /// Disconnects every shard and clears routing state.
@@ -414,7 +455,7 @@ impl PoolInner {
     }
 
     // Callers hold `wire_mutex`.
-    async fn subscribe_one(&self, asset_id: String) -> anyhow::Result<()> {
+    async fn subscribe_one(self: &Arc<Self>, asset_id: String) -> anyhow::Result<()> {
         let token = Ustr::from(asset_id.as_str());
 
         let Some(handle) = self.assign(token).await? else {
@@ -447,7 +488,7 @@ impl PoolInner {
     }
 
     // Returns `None` when the token is already owned by a shard.
-    async fn assign(&self, token: Ustr) -> anyhow::Result<Option<WsSubscriptionHandle>> {
+    async fn assign(self: &Arc<Self>, token: Ustr) -> anyhow::Result<Option<WsSubscriptionHandle>> {
         {
             let mut state = self.state.lock().expect("pool state mutex poisoned");
             if state.assignments.contains_key(&token) {
@@ -501,7 +542,7 @@ impl PoolInner {
         }
     }
 
-    async fn connect_new_shard(&self, is_primary: bool) -> anyhow::Result<usize> {
+    async fn connect_new_shard(self: &Arc<Self>, is_primary: bool) -> anyhow::Result<usize> {
         if self.closed.load(Ordering::Acquire) {
             anyhow::bail!("Market connection pool is closed");
         }
@@ -512,9 +553,8 @@ impl PoolInner {
 
         let handle = client.clone_subscription_handle();
         let rx = client
-            .take_message_receiver()
+            .take_connection_message_receiver()
             .ok_or_else(|| anyhow::anyhow!("Market shard receiver unavailable after connect"))?;
-        let forwarder = self.spawn_forwarder(rx);
 
         let mut state = self.state.lock().expect("pool state mutex poisoned");
         let id = if is_primary {
@@ -529,11 +569,20 @@ impl PoolInner {
             ShardEntry {
                 client,
                 handle,
-                forwarder: Some(forwarder),
+                forwarder: None,
                 owned: 0,
             },
         );
         drop(state);
+
+        let forwarder = self.spawn_forwarder(id, rx);
+        self.state
+            .lock()
+            .expect("pool state mutex poisoned")
+            .shards
+            .get_mut(&id)
+            .expect("new shard present")
+            .forwarder = Some(forwarder);
 
         log::debug!("Opened Polymarket market shard {id}");
         Ok(id)
@@ -549,22 +598,84 @@ impl PoolInner {
     }
 
     fn spawn_forwarder(
-        &self,
-        mut rx: tokio::sync::mpsc::UnboundedReceiver<PolymarketWsMessage>,
+        self: &Arc<Self>,
+        shard_id: usize,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<PolymarketConnectionMessage>,
     ) -> tokio::task::JoinHandle<()> {
         let out_tx = self
             .out_tx
             .lock()
             .expect("pool out_tx mutex poisoned")
             .clone();
+        let inner = Arc::downgrade(self);
 
         get_runtime().spawn(async move {
             let Some(out_tx) = out_tx else {
                 return;
             };
+            let shard_id = u64::try_from(shard_id).expect("usize fits in u64");
+            let mut last_transport_epoch = None;
 
-            while let Some(msg) = rx.recv().await {
-                if out_tx.send(msg).is_err() {
+            while let Some(connection_message) = rx.recv().await {
+                let transport_epoch = connection_message.transport_epoch;
+                if last_transport_epoch.is_some_and(|last| transport_epoch < last) {
+                    log::error!(
+                        "Polymarket market shard {shard_id} transport epoch regressed from {} to {transport_epoch}",
+                        last_transport_epoch.expect("checked Some"),
+                    );
+                    break;
+                }
+
+                let epoch_advanced = last_transport_epoch.is_some_and(|last| transport_epoch > last)
+                    || last_transport_epoch.is_none() && transport_epoch > 0;
+                let Some(connection_generation) = transport_epoch.checked_add(1) else {
+                    log::error!(
+                        "Polymarket market shard {shard_id} connection generation exhausted"
+                    );
+                    break;
+                };
+
+                if epoch_advanced {
+                    let Some(inner) = inner.upgrade() else {
+                        break;
+                    };
+                    let shard_index = usize::try_from(shard_id).expect("shard id fits");
+                    let mut assigned_asset_ids = inner
+                        .state
+                        .lock()
+                        .expect("pool state mutex poisoned")
+                        .assignments
+                        .iter()
+                        .filter_map(|(asset_id, assigned_shard)| {
+                            (*assigned_shard == shard_index).then_some(*asset_id)
+                        })
+                        .collect::<Vec<_>>();
+                    assigned_asset_ids.sort_unstable();
+                    if out_tx
+                        .send(PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+                            shard_id,
+                            connection_generation,
+                            assigned_asset_ids,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                last_transport_epoch = Some(transport_epoch);
+
+                if matches!(connection_message.message, PolymarketWsMessage::Reconnected) {
+                    continue;
+                }
+
+                if out_tx
+                    .send(PolymarketMarketPoolEvent::Message {
+                        shard_id,
+                        connection_generation,
+                        message: connection_message.message,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -655,7 +766,21 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::websocket::handler::HandlerCommand;
+    use crate::websocket::{
+        handler::HandlerCommand,
+        messages::{MarketWsMessage, PolymarketQuotes},
+    };
+
+    fn connection_message(transport_epoch: u64) -> PolymarketConnectionMessage {
+        PolymarketConnectionMessage {
+            transport_epoch,
+            message: PolymarketWsMessage::Market(MarketWsMessage::PriceChange(PolymarketQuotes {
+                market: Ustr::from("market"),
+                price_changes: Vec::new(),
+                timestamp: "1".to_string(),
+            })),
+        }
+    }
 
     // Bare state with unconnected shards for pure capacity-accounting tests.
     fn state_with_shards(owned: &[usize]) -> PoolState {
@@ -738,6 +863,73 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
         assert_eq!(handle.inner.subscription_count_for_test(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn forwarder_emits_exact_epoch_boundary_before_first_new_epoch_message() {
+        let inner = Arc::new(PoolInner::new(
+            None,
+            TransportBackend::default(),
+            false,
+            WS_DEFAULT_SUBSCRIPTIONS,
+        ));
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+        *inner.out_tx.lock().expect("pool out_tx mutex poisoned") = Some(out_tx);
+        {
+            let mut state = inner.state.lock().expect("pool state mutex poisoned");
+            state.assignments.insert(Ustr::from("token-b"), 3);
+            state.assignments.insert(Ustr::from("token-a"), 3);
+        }
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        let forwarder = inner.spawn_forwarder(3, raw_rx);
+
+        raw_tx.send(connection_message(0)).expect("epoch zero");
+        raw_tx.send(connection_message(1)).expect("epoch one data");
+        raw_tx
+            .send(PolymarketConnectionMessage {
+                transport_epoch: 1,
+                message: PolymarketWsMessage::Reconnected,
+            })
+            .expect("epoch one marker");
+        drop(raw_tx);
+
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(PolymarketMarketPoolEvent::Message {
+                shard_id: 3,
+                connection_generation: 1,
+                ..
+            })
+        ));
+        match out_rx.recv().await.expect("epoch boundary") {
+            PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+                shard_id,
+                connection_generation,
+                assigned_asset_ids,
+            } => {
+                assert_eq!(shard_id, 3);
+                assert_eq!(connection_generation, 2);
+                assert_eq!(
+                    assigned_asset_ids,
+                    [Ustr::from("token-a"), Ustr::from("token-b")]
+                );
+            }
+            other => panic!("unexpected pool event: {other:?}"),
+        }
+        assert!(matches!(
+            out_rx.recv().await,
+            Some(PolymarketMarketPoolEvent::Message {
+                shard_id: 3,
+                connection_generation: 2,
+                ..
+            })
+        ));
+        forwarder.await.expect("forwarder exits");
+        assert!(
+            out_rx.try_recv().is_err(),
+            "marker must not duplicate boundary"
+        );
     }
 
     #[rstest]
