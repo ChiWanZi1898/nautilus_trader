@@ -9,13 +9,19 @@
 
 //! Immutable adapter evidence facts and their application-owned durability bridge.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Debug,
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use aws_lc_rs::digest;
 use nautilus_model::identifiers::{ClientOrderId, VenueOrderId};
 
-use crate::{common::enums::PolymarketOrderType, http::models::PolymarketOrder};
+use crate::{
+    common::enums::PolymarketOrderType, http::models::PolymarketOrder, signing::eip712::order_hash,
+};
 
 const PREPARED_ID_DOMAIN: &[u8] = b"nautilus-polymarket/submit-prepared/v1\0";
 const USER_FRAME_ID_DOMAIN: &[u8] = b"nautilus-polymarket/authenticated-user-frame/v1\0";
@@ -33,6 +39,7 @@ pub struct PolymarketSignedLimitEvidence {
     order: PolymarketOrder,
     order_type: PolymarketOrderType,
     post_only: bool,
+    neg_risk: bool,
     expected_venue_order_id: VenueOrderId,
     client_order_id: ClientOrderId,
 }
@@ -54,6 +61,11 @@ impl PolymarketSignedLimitEvidence {
     }
 
     #[must_use]
+    pub const fn neg_risk(&self) -> bool {
+        self.neg_risk
+    }
+
+    #[must_use]
     pub const fn expected_venue_order_id(&self) -> VenueOrderId {
         self.expected_venue_order_id
     }
@@ -67,6 +79,7 @@ impl PolymarketSignedLimitEvidence {
         order: PolymarketOrder,
         order_type: PolymarketOrderType,
         post_only: bool,
+        neg_risk: bool,
         expected_venue_order_id: VenueOrderId,
         client_order_id: ClientOrderId,
     ) -> Self {
@@ -74,9 +87,40 @@ impl PolymarketSignedLimitEvidence {
             order,
             order_type,
             post_only,
+            neg_risk,
             expected_venue_order_id,
             client_order_id,
         }
+    }
+
+    /// Restores and verifies one credential-free signed leg.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the retained expected venue identity equals the
+    /// EIP-712 hash of the exact signed fields and neg-risk domain.
+    pub fn try_restore(
+        order: PolymarketOrder,
+        order_type: PolymarketOrderType,
+        post_only: bool,
+        neg_risk: bool,
+        expected_venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+    ) -> Result<Self, PolymarketEvidenceError> {
+        let calculated =
+            order_hash(&order, neg_risk).map_err(|_| PolymarketEvidenceError::InvalidFact)?;
+        let calculated = VenueOrderId::from(format!("{calculated:#x}").as_str());
+        if calculated != expected_venue_order_id {
+            return Err(PolymarketEvidenceError::InvalidFact);
+        }
+        Ok(Self::new(
+            order,
+            order_type,
+            post_only,
+            neg_risk,
+            expected_venue_order_id,
+            client_order_id,
+        ))
     }
 }
 
@@ -158,6 +202,28 @@ impl PolymarketSubmitPrepared {
             legs: legs.into(),
         })
     }
+
+    /// Restores a prepared fact from the durable bridge representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid cardinality, identities, body hash, or any
+    /// signed leg whose retained EIP-712 identity does not verify.
+    pub fn try_restore(
+        endpoint: PolymarketMutationEndpoint,
+        body_sha256: [u8; 32],
+        legs: Vec<PolymarketSignedLimitEvidence>,
+    ) -> Result<Self, PolymarketEvidenceError> {
+        for leg in &legs {
+            let calculated = order_hash(leg.order(), leg.neg_risk())
+                .map_err(|_| PolymarketEvidenceError::InvalidFact)?;
+            let calculated = VenueOrderId::from(format!("{calculated:#x}").as_str());
+            if calculated != leg.expected_venue_order_id() {
+                return Err(PolymarketEvidenceError::InvalidFact);
+            }
+        }
+        Self::try_new(endpoint, body_sha256, legs)
+    }
 }
 
 /// Immutable transition persisted immediately before the HTTP handoff.
@@ -183,6 +249,24 @@ impl PolymarketHandoffStarted {
             prepared_fact_id: prepared.fact_id,
             body_sha256: prepared.body_sha256,
         }
+    }
+
+    /// Restores a handoff marker from durable fields.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a reserved zero identity or body hash.
+    pub fn try_restore(
+        prepared_fact_id: [u8; 32],
+        body_sha256: [u8; 32],
+    ) -> Result<Self, PolymarketEvidenceError> {
+        if prepared_fact_id == [0_u8; 32] || body_sha256 == [0_u8; 32] {
+            return Err(PolymarketEvidenceError::InvalidFact);
+        }
+        Ok(Self {
+            prepared_fact_id,
+            body_sha256,
+        })
     }
 }
 
@@ -260,6 +344,210 @@ impl PolymarketAuthenticatedUserFrame {
             raw_utf8: Arc::from(raw_utf8),
         })
     }
+
+    /// Restores and rehashes one exact authenticated frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero counters or an empty frame.
+    pub fn try_restore(
+        session_epoch: u64,
+        frame_sequence: u64,
+        raw_utf8: &[u8],
+    ) -> Result<Self, PolymarketEvidenceError> {
+        Self::try_new(session_epoch, frame_sequence, raw_utf8)
+    }
+}
+
+/// One owned mutation WAL record in its independent durable sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolymarketRecoveredMutation {
+    evidence_sequence: u64,
+    fact: PolymarketRecoveredMutationFact,
+}
+
+impl PolymarketRecoveredMutation {
+    /// Restores one mutation record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the reserved zero evidence sequence.
+    pub fn try_new(
+        evidence_sequence: u64,
+        fact: PolymarketRecoveredMutationFact,
+    ) -> Result<Self, PolymarketEvidenceError> {
+        if evidence_sequence == 0 {
+            return Err(PolymarketEvidenceError::Recovery);
+        }
+        Ok(Self {
+            evidence_sequence,
+            fact,
+        })
+    }
+
+    #[must_use]
+    pub const fn evidence_sequence(&self) -> u64 {
+        self.evidence_sequence
+    }
+
+    #[must_use]
+    pub const fn fact(&self) -> &PolymarketRecoveredMutationFact {
+        &self.fact
+    }
+}
+
+/// Owned mutation fact variants returned during recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolymarketRecoveredMutationFact {
+    SubmitPrepared(PolymarketSubmitPrepared),
+    HandoffStarted(PolymarketHandoffStarted),
+}
+
+/// One owned inbound WAL record in its independent durable sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolymarketRecoveredUserFrame {
+    evidence_sequence: u64,
+    frame: PolymarketAuthenticatedUserFrame,
+}
+
+impl PolymarketRecoveredUserFrame {
+    /// Restores one inbound record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for the reserved zero evidence sequence.
+    pub fn try_new(
+        evidence_sequence: u64,
+        frame: PolymarketAuthenticatedUserFrame,
+    ) -> Result<Self, PolymarketEvidenceError> {
+        if evidence_sequence == 0 {
+            return Err(PolymarketEvidenceError::Recovery);
+        }
+        Ok(Self {
+            evidence_sequence,
+            frame,
+        })
+    }
+
+    #[must_use]
+    pub const fn evidence_sequence(&self) -> u64 {
+        self.evidence_sequence
+    }
+
+    #[must_use]
+    pub const fn frame(&self) -> &PolymarketAuthenticatedUserFrame {
+        &self.frame
+    }
+}
+
+/// Complete verified mutation/inbound prefixes captured before adapter start.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolymarketEvidenceRecovery {
+    lineage: [u8; 32],
+    mutation_high_watermark: u64,
+    inbound_high_watermark: u64,
+    mutations: Arc<[PolymarketRecoveredMutation]>,
+    user_frames: Arc<[PolymarketRecoveredUserFrame]>,
+}
+
+impl PolymarketEvidenceRecovery {
+    /// Validates two exact independent recovery prefixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for zero lineage, a sequence gap/reorder, duplicate or
+    /// orphan mutation identity, handoff/body mismatch, or duplicate user
+    /// session/frame identity.
+    pub fn try_new(
+        lineage: [u8; 32],
+        mutation_high_watermark: u64,
+        inbound_high_watermark: u64,
+        mutations: Vec<PolymarketRecoveredMutation>,
+        user_frames: Vec<PolymarketRecoveredUserFrame>,
+    ) -> Result<Self, PolymarketEvidenceError> {
+        if lineage == [0_u8; 32]
+            || !is_complete_prefix(
+                mutations.iter().map(|record| record.evidence_sequence),
+                mutation_high_watermark,
+            )
+            || !is_complete_prefix(
+                user_frames.iter().map(|record| record.evidence_sequence),
+                inbound_high_watermark,
+            )
+        {
+            return Err(PolymarketEvidenceError::Recovery);
+        }
+
+        let mut prepared = HashMap::new();
+        let mut handed_off = HashSet::new();
+        for record in &mutations {
+            match record.fact() {
+                PolymarketRecoveredMutationFact::SubmitPrepared(fact) => {
+                    if prepared
+                        .insert(*fact.fact_id(), *fact.body_sha256())
+                        .is_some()
+                    {
+                        return Err(PolymarketEvidenceError::Recovery);
+                    }
+                }
+                PolymarketRecoveredMutationFact::HandoffStarted(fact) => {
+                    if prepared.get(fact.prepared_fact_id()) != Some(fact.body_sha256())
+                        || !handed_off.insert(*fact.prepared_fact_id())
+                    {
+                        return Err(PolymarketEvidenceError::Recovery);
+                    }
+                }
+            }
+        }
+        let mut previous_frame: Option<(u64, u64)> = None;
+        for record in &user_frames {
+            let current = (record.frame.session_epoch(), record.frame.frame_sequence());
+            match previous_frame {
+                None if current.1 != 1 => return Err(PolymarketEvidenceError::Recovery),
+                Some((epoch, sequence)) if current.0 == epoch => {
+                    if sequence.checked_add(1) != Some(current.1) {
+                        return Err(PolymarketEvidenceError::Recovery);
+                    }
+                }
+                Some((epoch, _)) if current.0 > epoch && current.1 == 1 => {}
+                Some(_) => return Err(PolymarketEvidenceError::Recovery),
+                None => {}
+            }
+            previous_frame = Some(current);
+        }
+        Ok(Self {
+            lineage,
+            mutation_high_watermark,
+            inbound_high_watermark,
+            mutations: mutations.into(),
+            user_frames: user_frames.into(),
+        })
+    }
+
+    #[must_use]
+    pub const fn lineage(&self) -> &[u8; 32] {
+        &self.lineage
+    }
+
+    #[must_use]
+    pub const fn mutation_high_watermark(&self) -> u64 {
+        self.mutation_high_watermark
+    }
+
+    #[must_use]
+    pub const fn inbound_high_watermark(&self) -> u64 {
+        self.inbound_high_watermark
+    }
+
+    #[must_use]
+    pub fn mutations(&self) -> &[PolymarketRecoveredMutation] {
+        &self.mutations
+    }
+
+    #[must_use]
+    pub fn user_frames(&self) -> &[PolymarketRecoveredUserFrame] {
+        &self.user_frames
+    }
 }
 
 impl PolymarketMutationEvidence<'_> {
@@ -323,6 +611,9 @@ pub enum PolymarketEvidenceError {
 /// Application-owned durability boundary injected into the adapter.
 #[async_trait]
 pub trait PolymarketEvidenceBridge: Debug + Send + Sync {
+    /// Returns the complete prefixes verified under the bridge process lock.
+    fn recover(&self) -> Result<PolymarketEvidenceRecovery, PolymarketEvidenceError>;
+
     /// Appends one immutable mutation fact and returns only after durability.
     async fn append_mutation(
         &self,
@@ -336,9 +627,94 @@ pub trait PolymarketEvidenceBridge: Debug + Send + Sync {
     ) -> Result<PolymarketEvidenceAck, PolymarketEvidenceError>;
 }
 
+fn is_complete_prefix(sequences: impl Iterator<Item = u64>, high_watermark: u64) -> bool {
+    let mut expected = 1_u64;
+    for sequence in sequences {
+        if sequence != expected {
+            return false;
+        }
+        let Some(next) = expected.checked_add(1) else {
+            return false;
+        };
+        expected = next;
+    }
+    expected.checked_sub(1) == Some(high_watermark)
+}
+
 fn append_bounded_text(target: &mut Vec<u8>, value: &str) -> Result<(), PolymarketEvidenceError> {
     let length = u16::try_from(value.len()).map_err(|_| PolymarketEvidenceError::InvalidFact)?;
     target.extend_from_slice(&length.to_be_bytes());
     target.extend_from_slice(value.as_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn recovered_frame(
+        evidence_sequence: u64,
+        session_epoch: u64,
+        frame_sequence: u64,
+    ) -> PolymarketRecoveredUserFrame {
+        PolymarketRecoveredUserFrame::try_new(
+            evidence_sequence,
+            PolymarketAuthenticatedUserFrame::try_restore(
+                session_epoch,
+                frame_sequence,
+                br#"{"event_type":"order"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[rstest]
+    fn recovery_accepts_independent_complete_prefixes_and_session_rollover() {
+        let recovery = PolymarketEvidenceRecovery::try_new(
+            [0x51; 32],
+            0,
+            3,
+            Vec::new(),
+            vec![
+                recovered_frame(1, 7, 1),
+                recovered_frame(2, 7, 2),
+                recovered_frame(3, 9, 1),
+            ],
+        )
+        .unwrap();
+        assert_eq!(recovery.mutation_high_watermark(), 0);
+        assert_eq!(recovery.inbound_high_watermark(), 3);
+    }
+
+    #[rstest]
+    #[case(vec![recovered_frame(1, 1, 2)], 1)]
+    #[case(vec![recovered_frame(1, 1, 1), recovered_frame(2, 1, 3)], 2)]
+    #[case(vec![recovered_frame(1, 2, 1), recovered_frame(2, 1, 1)], 2)]
+    #[case(vec![recovered_frame(1, 1, 1), recovered_frame(2, 2, 2)], 2)]
+    fn recovery_rejects_noncontiguous_user_session_frames(
+        #[case] frames: Vec<PolymarketRecoveredUserFrame>,
+        #[case] high_watermark: u64,
+    ) {
+        assert_eq!(
+            PolymarketEvidenceRecovery::try_new([0x52; 32], 0, high_watermark, Vec::new(), frames,),
+            Err(PolymarketEvidenceError::Recovery),
+        );
+    }
+
+    #[rstest]
+    fn recovery_rejects_orphan_handoff() {
+        let handoff = PolymarketHandoffStarted::try_restore([0x11; 32], [0x22; 32]).unwrap();
+        let mutation = PolymarketRecoveredMutation::try_new(
+            1,
+            PolymarketRecoveredMutationFact::HandoffStarted(handoff),
+        )
+        .unwrap();
+        assert_eq!(
+            PolymarketEvidenceRecovery::try_new([0x53; 32], 1, 0, vec![mutation], Vec::new(),),
+            Err(PolymarketEvidenceError::Recovery),
+        );
+    }
 }

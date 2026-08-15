@@ -459,7 +459,10 @@ mod tests {
     use super::*;
     use crate::{
         common::enums::PolymarketOrderSide,
-        evidence::{PolymarketEvidenceAck, PolymarketEvidenceError, PolymarketMutationEvidence},
+        evidence::{
+            PolymarketEvidenceAck, PolymarketEvidenceError, PolymarketEvidenceRecovery,
+            PolymarketMutationEvidence,
+        },
     };
 
     #[derive(Debug, Default)]
@@ -470,6 +473,10 @@ mod tests {
 
     #[async_trait]
     impl PolymarketEvidenceBridge for TestFrameBridge {
+        fn recover(&self) -> Result<PolymarketEvidenceRecovery, PolymarketEvidenceError> {
+            PolymarketEvidenceRecovery::try_new([0x41; 32], 0, 0, Vec::new(), Vec::new())
+        }
+
         async fn append_mutation(
             &self,
             _fact: &PolymarketMutationEvidence<'_>,

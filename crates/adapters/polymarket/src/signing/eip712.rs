@@ -29,7 +29,7 @@ use alloy::{
     signers::{SignerSync, local::PrivateKeySigner},
     sol_types::{SolStruct, SolValue, eip712_domain},
 };
-use alloy_primitives::{Address, B256, FixedBytes, U256, address, keccak256};
+use alloy_primitives::{Address, B256, FixedBytes, Signature, U256, address, keccak256};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -229,6 +229,32 @@ pub fn order_hash(order: &PolymarketOrder, neg_risk: bool) -> Result<B256> {
     };
 
     Ok(eip712_order.eip712_signing_hash(&domain))
+}
+
+/// Recovers the wallet which signed one exact CLOB V2 order.
+///
+/// # Errors
+///
+/// Returns an error when the retained signature is malformed or cannot be
+/// recovered against the selected standard/negative-risk EIP-712 domain.
+pub(crate) fn recover_order_signer(order: &PolymarketOrder, neg_risk: bool) -> Result<Address> {
+    let encoded = order
+        .signature
+        .strip_prefix("0x")
+        .ok_or_else(|| Error::bad_request("Order signature is missing 0x prefix"))?;
+    let bytes = alloy_primitives::hex::decode(encoded)
+        .map_err(|e| Error::bad_request(format!("Invalid order signature hex: {e}")))?;
+    if bytes.len() != 65 {
+        return Err(Error::bad_request("Order signature must contain 65 bytes"));
+    }
+    let signature = Signature::new(
+        U256::from_be_slice(&bytes[..32]),
+        U256::from_be_slice(&bytes[32..64]),
+        matches!(bytes[64], 1 | 28),
+    );
+    signature
+        .recover_address_from_prehash(&order_hash(order, neg_risk)?)
+        .map_err(|e| Error::bad_request(format!("Could not recover order signer: {e}")))
 }
 
 const fn exchange_contract(neg_risk: bool) -> Address {

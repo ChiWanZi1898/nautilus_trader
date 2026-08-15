@@ -84,7 +84,7 @@ use crate::{
         enums::{PolymarketBuilderAttribution, SignatureType},
     },
     config::PolymarketExecClientConfig,
-    evidence::PolymarketEvidenceBridge,
+    evidence::{PolymarketEvidenceBridge, PolymarketEvidenceRecovery},
     http::{clob::PolymarketClobHttpClient, data_api::PolymarketDataApiHttpClient},
     signing::eip712::OrderSigner,
     websocket::{client::PolymarketWebSocketClient, dispatch::WsDispatchState},
@@ -117,6 +117,7 @@ pub struct PolymarketExecutionClient {
     fill_tracker: Arc<OrderFillTrackerMap>,
     ws_dispatch_state: Arc<Mutex<WsDispatchState>>,
     evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
+    evidence_recovery: Option<PolymarketEvidenceRecovery>,
 }
 
 impl PolymarketExecutionClient {
@@ -160,6 +161,11 @@ impl PolymarketExecutionClient {
         config: PolymarketExecClientConfig,
         evidence_bridge: Option<Arc<dyn PolymarketEvidenceBridge>>,
     ) -> anyhow::Result<Self> {
+        let evidence_recovery = evidence_bridge
+            .as_ref()
+            .map(|bridge| bridge.recover())
+            .transpose()
+            .context("failed to recover Polymarket durable evidence")?;
         let proxy_url = config.validated_proxy_url()?;
         let secrets = Secrets::resolve(
             config.private_key.as_deref(),
@@ -268,6 +274,7 @@ impl PolymarketExecutionClient {
             fill_tracker: Arc::new(OrderFillTrackerMap::new()),
             ws_dispatch_state: Arc::new(Mutex::new(WsDispatchState::default())),
             evidence_bridge,
+            evidence_recovery,
         })
     }
 }

@@ -88,7 +88,7 @@ use nautilus_polymarket::{
     config::PolymarketExecClientConfig,
     evidence::{
         PolymarketAuthenticatedUserFrame, PolymarketEvidenceAck, PolymarketEvidenceBridge,
-        PolymarketEvidenceError, PolymarketMutationEvidence,
+        PolymarketEvidenceError, PolymarketEvidenceRecovery, PolymarketMutationEvidence,
     },
     execution::PolymarketExecutionClient,
     http::models::PolymarketOrder,
@@ -327,6 +327,10 @@ impl TestEvidenceBridge {
 
 #[async_trait]
 impl PolymarketEvidenceBridge for TestEvidenceBridge {
+    fn recover(&self) -> Result<PolymarketEvidenceRecovery, PolymarketEvidenceError> {
+        PolymarketEvidenceRecovery::try_new([0x41; 32], 0, 0, Vec::new(), Vec::new())
+    }
+
     async fn append_mutation(
         &self,
         fact: &PolymarketMutationEvidence<'_>,

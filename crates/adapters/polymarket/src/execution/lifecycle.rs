@@ -30,21 +30,34 @@ use nautilus_common::{
 };
 use nautilus_core::{MUTEX_POISONED, collections::AtomicMap, time::AtomicTime};
 use nautilus_model::{
+    enums::OrderType,
     events::{OrderEventAny, OrderFilled, PositionEvent},
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
-    orders::Order,
+    orders::{Order, OrderAny},
 };
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
-use super::PolymarketExecutionClient;
+use super::{
+    PolymarketExecutionClient,
+    activation::activate_expected_submit,
+    order_builder::{ZERO_BYTES32, compute_maker_taker_amounts},
+};
 use crate::{
+    common::{
+        consts::POLYMARKET_ZERO_BUILDER_CODE,
+        enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
+    },
+    evidence::{
+        PolymarketEvidenceRecovery, PolymarketRecoveredMutationFact, PolymarketSignedLimitEvidence,
+    },
     execution::{identity::OrderIdentity, reports::fetch_and_emit_account_state},
     http::{clob::HeartbeatResponse, error::Error as HttpError},
+    signing::eip712::recover_order_signer,
     websocket::{
         dispatch::{WsDispatchContext, WsDispatchState, dispatch_user_message},
-        messages::PolymarketWsMessage,
+        messages::{PolymarketWsMessage, UserWsMessage},
     },
 };
 
@@ -458,6 +471,174 @@ impl PolymarketExecutionClient {
         log::debug!("Loaded {} order lifecycles from cache", orders.len());
     }
 
+    fn restore_evidence_before_connect(&mut self) -> anyhow::Result<()> {
+        let Some(recovery) = self.evidence_recovery.clone() else {
+            return Ok(());
+        };
+
+        self.restore_ambiguous_mutations(&recovery)?;
+        self.replay_authenticated_user_frames(&recovery)?;
+        self.evidence_recovery = None;
+        log::info!(
+            "Restored Polymarket evidence through mutation H={} and inbound H={}",
+            recovery.mutation_high_watermark(),
+            recovery.inbound_high_watermark(),
+        );
+        Ok(())
+    }
+
+    fn restore_ambiguous_mutations(
+        &self,
+        recovery: &PolymarketEvidenceRecovery,
+    ) -> anyhow::Result<()> {
+        let prepared = recovery
+            .mutations()
+            .iter()
+            .filter_map(|record| match record.fact() {
+                PolymarketRecoveredMutationFact::SubmitPrepared(fact) => {
+                    Some((*fact.fact_id(), fact))
+                }
+                PolymarketRecoveredMutationFact::HandoffStarted(_) => None,
+            })
+            .collect::<AHashMap<_, _>>();
+
+        for record in recovery.mutations() {
+            let PolymarketRecoveredMutationFact::HandoffStarted(handoff) = record.fact() else {
+                continue;
+            };
+            let fact = prepared
+                .get(handoff.prepared_fact_id())
+                .context("recovered handoff is missing its prepared mutation")?;
+            for leg in fact.legs() {
+                let order = {
+                    let cache = self.core.cache();
+                    cache
+                        .order(&leg.client_order_id())
+                        .map(|order| order.cloned())
+                        .context("recovered signed order is absent from the Nautilus cache")?
+                };
+                self.validate_recovered_signed_leg(&order, leg)?;
+                if order.venue_order_id() == Some(leg.expected_venue_order_id()) {
+                    continue;
+                }
+                let mut activation = activate_expected_submit(
+                    &order,
+                    leg.expected_venue_order_id(),
+                    &self.fill_tracker,
+                    &self.order_identities,
+                    &self.pending_submits,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("failed to restore ambiguous expected order identity")?;
+                activation.mark_http_handoff_started();
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_recovered_signed_leg(
+        &self,
+        order: &OrderAny,
+        leg: &PolymarketSignedLimitEvidence,
+    ) -> anyhow::Result<()> {
+        let signed = leg.order();
+        let expected_venue = leg.expected_venue_order_id();
+        if order.client_order_id() != leg.client_order_id()
+            || order.order_type() != OrderType::Limit
+            || PolymarketOrderType::try_from(order.time_in_force()).ok() != Some(leg.order_type())
+            || order.is_post_only() != leg.post_only()
+            || order
+                .venue_order_id()
+                .is_some_and(|venue| venue != expected_venue)
+        {
+            anyhow::bail!("recovered signed order lifecycle does not match cached order");
+        }
+
+        let token_id = Ustr::from(signed.token_id.as_str());
+        let instrument = self
+            .shared_token_instruments
+            .get_cloned(&token_id)
+            .context("recovered signed order token is absent from instrument cache")?;
+        if instrument.id() != order.instrument_id()
+            || self.get_neg_risk(&order.instrument_id()) != leg.neg_risk()
+        {
+            anyhow::bail!("recovered signed order instrument/domain mismatch");
+        }
+
+        let expected_side = PolymarketOrderSide::try_from(order.order_side())?;
+        let price = order.price().context("cached LIMIT order has no price")?;
+        let (maker_amount, taker_amount) = compute_maker_taker_amounts(
+            price.as_decimal(),
+            order.quantity().as_decimal(),
+            expected_side,
+            u32::from(instrument.price_precision()),
+        );
+        let expected_expiration = match order.expire_time() {
+            Some(value) if value.as_u64() > 0 => (value.as_u64() / 1_000_000_000).to_string(),
+            _ => "0".to_string(),
+        };
+        let maker_address = super::resolve_maker_address(
+            self.config.signature_type,
+            &self.secrets.address,
+            self.secrets.funder.as_deref(),
+        )?;
+        let expected_signer_field = if self.config.signature_type == SignatureType::Poly1271 {
+            maker_address.as_str()
+        } else {
+            self.secrets.address.as_str()
+        };
+        let recovered_signer = recover_order_signer(signed, leg.neg_risk())?;
+        if signed.side != expected_side
+            || signed.maker_amount != maker_amount
+            || signed.taker_amount != taker_amount
+            || signed.expiration != expected_expiration
+            || signed.signature_type != self.config.signature_type
+            || !signed.maker.eq_ignore_ascii_case(&maker_address)
+            || !signed.signer.eq_ignore_ascii_case(expected_signer_field)
+            || !format!("{recovered_signer:#x}").eq_ignore_ascii_case(&self.secrets.address)
+            || signed.metadata != ZERO_BYTES32
+            || signed.builder != POLYMARKET_ZERO_BUILDER_CODE
+        {
+            anyhow::bail!("recovered signed order economics or signature mismatch");
+        }
+        Ok(())
+    }
+
+    fn replay_authenticated_user_frames(
+        &self,
+        recovery: &PolymarketEvidenceRecovery,
+    ) -> anyhow::Result<()> {
+        let user_address = self
+            .secrets
+            .funder
+            .as_deref()
+            .unwrap_or(self.secrets.address.as_str());
+        let user_api_key = self.secrets.credential.api_key().to_string();
+        let ctx = WsDispatchContext {
+            token_instruments: &self.shared_token_instruments,
+            fill_tracker: &self.fill_tracker,
+            pending_submits: &self.pending_submits,
+            order_identities: &self.order_identities,
+            emitter: &self.emitter,
+            account_id: self.core.account_id,
+            clock: self.clock,
+            user_address,
+            user_api_key: &user_api_key,
+        };
+        let mut state = self.ws_dispatch_state.lock().expect(MUTEX_POISONED);
+        for record in recovery.user_frames() {
+            let text = std::str::from_utf8(record.frame().raw_utf8())
+                .context("recovered authenticated user frame is not UTF-8")?;
+            let messages = UserWsMessage::parse_batch(text)
+                .or_else(|_| UserWsMessage::parse(text).map(|message| vec![message]))
+                .context("recovered authenticated user frame cannot be parsed")?;
+            for message in messages {
+                let _ = dispatch_user_message(&message, &ctx, &mut state);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn start_client(&mut self) {
         if self.core.is_started() {
             return;
@@ -520,6 +701,7 @@ impl PolymarketExecutionClient {
 
         self.load_instruments_from_cache();
         self.load_orders_from_cache();
+        self.restore_evidence_before_connect()?;
         self.core.set_instruments_initialized();
 
         self.start_ws_stream().await?;

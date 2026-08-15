@@ -101,6 +101,7 @@ fn build_submit_prepared_evidence(
                 submission.order().clone(),
                 submission.order_type(),
                 submission.post_only(),
+                submission.neg_risk(),
                 submission.expected_venue_order_id(),
                 order.client_order_id(),
             )

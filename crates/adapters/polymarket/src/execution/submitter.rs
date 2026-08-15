@@ -407,6 +407,7 @@ impl OrderSubmitter {
             order,
             order_type,
             post_only: request.post_only,
+            neg_risk: request.neg_risk,
             expected_venue_order_id,
         })
     }

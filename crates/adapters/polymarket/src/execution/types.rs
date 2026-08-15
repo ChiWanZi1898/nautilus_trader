@@ -66,6 +66,7 @@ pub(crate) struct SignedLimitOrderSubmission {
     pub(crate) order: PolymarketOrder,
     pub(crate) order_type: PolymarketOrderType,
     pub(crate) post_only: bool,
+    pub(crate) neg_risk: bool,
     pub(crate) expected_venue_order_id: VenueOrderId,
 }
 
@@ -80,6 +81,10 @@ impl SignedLimitOrderSubmission {
 
     pub(crate) const fn post_only(&self) -> bool {
         self.post_only
+    }
+
+    pub(crate) const fn neg_risk(&self) -> bool {
+        self.neg_risk
     }
 
     pub(crate) const fn expected_venue_order_id(&self) -> VenueOrderId {
