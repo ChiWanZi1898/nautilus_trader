@@ -55,7 +55,7 @@ use nautilus_common::{
     },
     testing::wait_until_async,
 };
-use nautilus_core::{UUID4, UnixNanos};
+use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, cash::CashAccount},
@@ -78,7 +78,7 @@ use nautilus_model::{
 use nautilus_network::http::HttpClient;
 use nautilus_polymarket::{
     common::{
-        consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
+        consts::{POLYMARKET_CLIENT_ID, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM, POLYMARKET_VENUE},
         enums::SignatureType,
     },
     config::PolymarketExecClientConfig,
@@ -2980,6 +2980,14 @@ fn make_submit_cmd(order: &OrderAny, instrument_id: InstrumentId) -> SubmitOrder
 }
 
 fn make_submit_order_list_cmd(instrument_id: InstrumentId, orders: &[OrderAny]) -> SubmitOrderList {
+    make_submit_order_list_cmd_with_params(instrument_id, orders, None)
+}
+
+fn make_submit_order_list_cmd_with_params(
+    instrument_id: InstrumentId,
+    orders: &[OrderAny],
+    params: Option<Params>,
+) -> SubmitOrderList {
     let strategy_id = StrategyId::from("S-001");
     let order_list = OrderList::new(
         OrderListId::from("OL-001"),
@@ -3001,11 +3009,20 @@ fn make_submit_order_list_cmd(instrument_id: InstrumentId, orders: &[OrderAny]) 
         order_inits,
         None,
         None,
-        None,
+        params,
         UUID4::new(),
         UnixNanos::default(),
         None, // correlation_id
     )
+}
+
+fn prepare_all_or_none_params(required: bool) -> Params {
+    let mut params = Params::new();
+    params.insert(
+        POLYMARKET_PREPARE_ALL_OR_NONE_PARAM.to_string(),
+        json!(required),
+    );
+    params
 }
 
 fn make_cancel_cmd(client_order_id: &str, instrument_id: InstrumentId) -> CancelOrder {
@@ -3042,6 +3059,22 @@ fn add_instrument_to_cache_with_tick(
     size_precision: u8,
 ) {
     let symbol = "71321045679252212594626385532706912750332728571942532289631379312455583992563";
+    add_instrument_to_cache_with_tick_and_symbol(
+        cache,
+        instrument_id,
+        tick_size,
+        size_precision,
+        symbol,
+    );
+}
+
+fn add_instrument_to_cache_with_tick_and_symbol(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    tick_size: &str,
+    size_precision: u8,
+    symbol: &str,
+) {
     let price_increment = Price::from(tick_size);
     let size_increment = if size_precision == 0 {
         Quantity::from("1")
@@ -4066,8 +4099,10 @@ async fn test_submit_order_list_denies_unrepresentable_immediate_buys_before_pos
 }
 
 #[rstest]
+#[case::ordinary(false)]
+#[case::prepare_all_or_none(true)]
 #[tokio::test]
-async fn test_submit_order_list_posts_batch_and_accepts_orders() {
+async fn test_submit_order_list_posts_batch_and_accepts_orders(#[case] prepare_all_or_none: bool) {
     let state = TestServerState::default();
     *state.batch_order_response.lock().await = Some(json!([
         {"success": true, "orderID": "0xbatch-order-1", "errorMsg": ""},
@@ -4107,7 +4142,8 @@ async fn test_submit_order_list_posts_batch_and_accepts_orders() {
         .add_order(order2.clone(), None, None, false)
         .unwrap();
 
-    let cmd = make_submit_order_list_cmd(instrument_id, &[order1, order2]);
+    let params = prepare_all_or_none.then(|| prepare_all_or_none_params(true));
+    let cmd = make_submit_order_list_cmd_with_params(instrument_id, &[order1, order2], params);
     client.submit_order_list(cmd).unwrap();
 
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
@@ -4210,7 +4246,11 @@ async fn test_submit_order_list_denies_invalid_orders_before_batch_post(
         .add_order(valid2.clone(), None, None, false)
         .unwrap();
 
-    let cmd = make_submit_order_list_cmd(instrument_id, &[valid1, invalid, valid2]);
+    let cmd = make_submit_order_list_cmd_with_params(
+        instrument_id,
+        &[valid1, invalid, valid2],
+        Some(prepare_all_or_none_params(false)),
+    );
     client.submit_order_list(cmd).unwrap();
 
     assert_order_event(recv_execution_event(&mut rx).await, "Denied");
@@ -4223,6 +4263,133 @@ async fn test_submit_order_list_denies_invalid_orders_before_batch_post(
     assert_eq!(state.last_path.lock().await.as_str(), "/orders");
     let body = state.last_body.lock().await.clone().unwrap();
     assert_eq!(body.as_array().unwrap().len(), 2);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_prepare_all_or_none_list_sends_nothing_when_one_leg_fails_preparation() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let invalid_instrument_id = InstrumentId::from("INVALID-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_tick(&cache, instrument_id, "0.001", 2);
+    add_instrument_to_cache_with_tick_and_symbol(
+        &cache,
+        invalid_instrument_id,
+        "0.001",
+        2,
+        "not-a-token-id",
+    );
+    let valid = make_limit_order_at_price_and_quantity(
+        "O-PREPARE-ALL-VALID",
+        instrument_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Fok,
+        Price::from("0.500"),
+        Quantity::from("5.00"),
+    );
+    let signing_failure = make_limit_order_at_price_and_quantity(
+        "O-PREPARE-ALL-SIGNING-FAILURE",
+        invalid_instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Fok,
+        Price::from("0.500"),
+        Quantity::from("5.00"),
+    );
+
+    for order in [&valid, &signing_failure] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    client
+        .submit_order_list(make_submit_order_list_cmd_with_params(
+            instrument_id,
+            &[valid, signing_failure],
+            Some(prepare_all_or_none_params(true)),
+        ))
+        .unwrap();
+
+    for _ in 0..2 {
+        let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+        let reason = order_event_reason(&denied);
+        assert!(reason.contains("failed preparation"), "reason was {reason}");
+        assert!(
+            reason.contains("no orders were submitted"),
+            "reason was {reason}"
+        );
+    }
+
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 0);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_prepare_all_or_none_list_sends_nothing_when_one_leg_fails_validation() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let valid = make_limit_order(
+        "O-PREPARE-ALL-VALID",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Fok,
+    );
+    let invalid = make_limit_order_at_price(
+        "O-PREPARE-ALL-INVALID",
+        instrument_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Fok,
+        Price::from("1.01"),
+    );
+
+    for order in [&valid, &invalid] {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    client
+        .submit_order_list(make_submit_order_list_cmd_with_params(
+            instrument_id,
+            &[valid, invalid],
+            Some(prepare_all_or_none_params(true)),
+        ))
+        .unwrap();
+
+    for _ in 0..2 {
+        let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
+        let reason = order_event_reason(&denied);
+        assert!(reason.contains("failed validation"), "reason was {reason}");
+    }
+
+    assert_eq!(*state.order_post_count.lock().await, 0);
+    assert_eq!(*state.batch_order_post_count.lock().await, 0);
+    assert_no_execution_event(&mut rx).await;
 }
 
 #[rstest]

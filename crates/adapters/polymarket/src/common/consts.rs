@@ -82,6 +82,13 @@ pub const WS_DEFAULT_SUBSCRIPTIONS: usize = 200;
 /// Maximum orders per `POST /orders` batch request; Polymarket caps batch submits at 15.
 pub const BATCH_ORDER_LIMIT: usize = 15;
 
+/// [`nautilus_core::Params`] key which requires local prepare-all-or-send-none semantics.
+///
+/// When this boolean parameter is exactly `true`, the execution adapter resolves, validates, and
+/// signs every leg before submitting any leg and denies the complete list if local preparation of
+/// one leg fails. This does not make execution of a multi-leg venue request atomic.
+pub const POLYMARKET_PREPARE_ALL_OR_NONE_PARAM: &str = "polymarket_prepare_all_or_none";
+
 /// Requests per minute.
 pub const HTTP_RATE_LIMIT: u32 = 100;
 

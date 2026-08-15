@@ -40,7 +40,24 @@ use super::{
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
     types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
 };
-use crate::common::consts::BATCH_ORDER_LIMIT;
+use crate::common::consts::{BATCH_ORDER_LIMIT, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM};
+
+fn requires_prepare_all_or_none(cmd: &SubmitOrderList) -> bool {
+    cmd.params
+        .as_ref()
+        .and_then(|params| params.get_bool(POLYMARKET_PREPARE_ALL_OR_NONE_PARAM))
+        == Some(true)
+}
+
+fn deny_prepare_all_or_none_batch(
+    emitter: &nautilus_live::ExecutionEventEmitter,
+    orders: &[OrderAny],
+    reason: &str,
+) {
+    for order in orders {
+        emitter.emit_order_denied(order, reason);
+    }
+}
 
 impl PolymarketExecutionClient {
     pub(super) fn submit_limit_order(&self, order: OrderAny) {
@@ -420,6 +437,18 @@ impl PolymarketExecutionClient {
 
     pub(super) fn submit_order_list_command(&self, cmd: &SubmitOrderList) {
         let mut batch_orders = Vec::with_capacity(cmd.order_inits.len());
+        let prepare_all_or_none = requires_prepare_all_or_none(cmd);
+        let mut plan_orders = Vec::with_capacity(cmd.order_inits.len());
+        let mut plan_failure = if prepare_all_or_none
+            && !(1..=BATCH_ORDER_LIMIT).contains(&cmd.order_inits.len())
+        {
+            Some(format!(
+                "Prepare-all-or-none order list must contain 1..={BATCH_ORDER_LIMIT} orders, found {}",
+                cmd.order_inits.len()
+            ))
+        } else {
+            None
+        };
         let neg_risk_index = self.neg_risk_index.load();
 
         for order_init in &cmd.order_inits {
@@ -433,43 +462,115 @@ impl PolymarketExecutionClient {
                     "Order not found in cache for {}",
                     order_init.client_order_id
                 );
+                if prepare_all_or_none && plan_failure.is_none() {
+                    plan_failure = Some(format!(
+                        "Prepare-all-or-none order {} was not found in cache",
+                        order_init.client_order_id
+                    ));
+                }
                 continue;
             };
 
             if order.is_closed() {
                 log::warn!("Cannot submit closed order {}", order.client_order_id());
+                if prepare_all_or_none && plan_failure.is_none() {
+                    plan_failure = Some(format!(
+                        "Prepare-all-or-none order {} is already closed",
+                        order.client_order_id()
+                    ));
+                }
                 continue;
+            }
+
+            if prepare_all_or_none {
+                plan_orders.push(order.clone());
             }
 
             match order.order_type() {
                 OrderType::Limit => {}
                 OrderType::Market => {
+                    if prepare_all_or_none {
+                        if plan_failure.is_none() {
+                            plan_failure = Some(format!(
+                                "Prepare-all-or-none order {} has unsupported order type Market",
+                                order.client_order_id()
+                            ));
+                        }
+                        continue;
+                    }
                     self.submit_market_order(order);
                     continue;
                 }
                 other => {
-                    self.emitter.emit_order_denied(
-                        &order,
-                        &format!("Unsupported order type for Polymarket: {other:?}"),
-                    );
+                    let reason = format!("Unsupported order type for Polymarket: {other:?}");
+                    if prepare_all_or_none {
+                        if plan_failure.is_none() {
+                            plan_failure = Some(format!(
+                                "Prepare-all-or-none order {} failed validation: {reason}",
+                                order.client_order_id()
+                            ));
+                        }
+                    } else {
+                        self.emitter.emit_order_denied(&order, &reason);
+                    }
                     continue;
                 }
             }
 
             if let Err(reason) = PolymarketOrderBuilder::validate_limit_order(&order) {
-                self.emitter.emit_order_denied(&order, &reason);
+                if prepare_all_or_none {
+                    if plan_failure.is_none() {
+                        plan_failure = Some(format!(
+                            "Prepare-all-or-none order {} failed validation: {reason}",
+                            order.client_order_id()
+                        ));
+                    }
+                } else {
+                    self.emitter.emit_order_denied(&order, &reason);
+                }
                 continue;
             }
 
-            let instrument = match self.resolve_instrument(&order) {
-                Some(i) => i,
-                None => continue,
+            let instrument = if prepare_all_or_none {
+                match self
+                    .core
+                    .cache()
+                    .instrument(&order.instrument_id())
+                    .cloned()
+                {
+                    Some(instrument) => instrument,
+                    None => {
+                        let reason =
+                            InstrumentLookupError::not_found(order.instrument_id()).to_string();
+                        if plan_failure.is_none() {
+                            plan_failure = Some(format!(
+                                "Prepare-all-or-none order {} failed resolution: {reason}",
+                                order.client_order_id()
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                match self.resolve_instrument(&order) {
+                    Some(instrument) => instrument,
+                    None => continue,
+                }
             };
 
             if let Err(reason) =
                 PolymarketOrderBuilder::validate_limit_price(&order, instrument.price_increment())
             {
-                self.emitter.emit_order_denied(&order, &reason);
+                if prepare_all_or_none {
+                    if plan_failure.is_none() {
+                        plan_failure = Some(format!(
+                            "Prepare-all-or-none order {} failed validation: {reason}",
+                            order.client_order_id()
+                        ));
+                    }
+                } else {
+                    self.emitter.emit_order_denied(&order, &reason);
+                }
                 continue;
             }
 
@@ -497,11 +598,16 @@ impl PolymarketExecutionClient {
             });
         }
 
+        if let Some(reason) = plan_failure {
+            deny_prepare_all_or_none_batch(&self.emitter, &plan_orders, &reason);
+            return;
+        }
+
         if batch_orders.is_empty() {
             return;
         }
 
-        if batch_orders.len() == 1 {
+        if !prepare_all_or_none && batch_orders.len() == 1 {
             let batch_order = batch_orders.pop().expect("len checked");
             self.submit_limit_order(batch_order.order);
             return;
@@ -518,13 +624,30 @@ impl PolymarketExecutionClient {
         let account_id = self.core.account_id;
 
         self.spawn_task("submit_order_list", async move {
-            for batch_order in &batch_orders {
-                emitter.emit_order_submitted(&batch_order.order);
+            if !prepare_all_or_none {
+                for batch_order in &batch_orders {
+                    emitter.emit_order_submitted(&batch_order.order);
+                }
             }
 
             let requests: Vec<LimitOrderSubmitRequest> =
                 batch_orders.iter().map(|bo| bo.request.clone()).collect();
             let prepare_results = submitter.prepare_limit_order_submissions(&requests).await;
+
+            if prepare_all_or_none
+                && let Some((failed_index, error)) = prepare_results
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, result)| result.as_ref().err().map(|error| (index, error)))
+            {
+                let failed_order = &batch_orders[failed_index].order;
+                let reason = format!(
+                    "Prepare-all-or-none order {} failed preparation; no orders were submitted: {error}",
+                    failed_order.client_order_id()
+                );
+                deny_prepare_all_or_none_batch(&emitter, &plan_orders, &reason);
+                return Ok(());
+            }
 
             let mut prepared_orders = Vec::with_capacity(batch_orders.len());
             let mut submissions = Vec::with_capacity(batch_orders.len());
@@ -544,6 +667,12 @@ impl PolymarketExecutionClient {
                             &pending_cancels,
                         );
                     }
+                }
+            }
+
+            if prepare_all_or_none {
+                for batch_order in &prepared_orders {
+                    emitter.emit_order_submitted(&batch_order.order);
                 }
             }
 
