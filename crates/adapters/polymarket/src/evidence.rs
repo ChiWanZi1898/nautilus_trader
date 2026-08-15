@@ -614,6 +614,13 @@ pub trait PolymarketEvidenceBridge: Debug + Send + Sync {
     /// Returns the complete prefixes verified under the bridge process lock.
     fn recover(&self) -> Result<PolymarketEvidenceRecovery, PolymarketEvidenceError>;
 
+    /// Opens H+1 appends only after the adapter has restored both exact prefixes.
+    fn acknowledge_recovery(
+        &self,
+        mutation_high_watermark: u64,
+        inbound_high_watermark: u64,
+    ) -> Result<(), PolymarketEvidenceError>;
+
     /// Appends one immutable mutation fact and returns only after durability.
     async fn append_mutation(
         &self,

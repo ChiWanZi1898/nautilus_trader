@@ -477,6 +477,18 @@ mod tests {
             PolymarketEvidenceRecovery::try_new([0x41; 32], 0, 0, Vec::new(), Vec::new())
         }
 
+        fn acknowledge_recovery(
+            &self,
+            mutation_high_watermark: u64,
+            inbound_high_watermark: u64,
+        ) -> Result<(), PolymarketEvidenceError> {
+            if mutation_high_watermark == 0 && inbound_high_watermark == 0 {
+                Ok(())
+            } else {
+                Err(PolymarketEvidenceError::InvalidAcknowledgement)
+            }
+        }
+
         async fn append_mutation(
             &self,
             _fact: &PolymarketMutationEvidence<'_>,

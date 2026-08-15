@@ -478,6 +478,14 @@ impl PolymarketExecutionClient {
 
         self.restore_ambiguous_mutations(&recovery)?;
         self.replay_authenticated_user_frames(&recovery)?;
+        self.evidence_bridge
+            .as_ref()
+            .context("recovered evidence has no durability bridge")?
+            .acknowledge_recovery(
+                recovery.mutation_high_watermark(),
+                recovery.inbound_high_watermark(),
+            )
+            .context("failed to acknowledge restored Polymarket evidence")?;
         self.evidence_recovery = None;
         log::info!(
             "Restored Polymarket evidence through mutation H={} and inbound H={}",
