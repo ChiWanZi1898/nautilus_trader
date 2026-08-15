@@ -86,13 +86,17 @@ pub struct PolymarketInstrumentDef {
 /// Each market produces two definitions: one for the Yes outcome
 /// and one for the No outcome.
 pub fn parse_gamma_market(market: &GammaMarket) -> anyhow::Result<Vec<PolymarketInstrumentDef>> {
-    let game_id = market.game_id.or_else(|| {
-        market
-            .events
-            .as_ref()?
-            .iter()
-            .find_map(|event| event.game_id)
-    });
+    let game_id = market
+        .game_id
+        .as_deref()
+        .and_then(|value| value.parse().ok())
+        .or_else(|| {
+            market
+                .events
+                .as_ref()?
+                .iter()
+                .find_map(|event| event.game_id.as_deref()?.parse().ok())
+        });
 
     let token_ids: Vec<String> = serde_json::from_str(&market.clob_token_ids).map_err(|e| {
         anyhow::anyhow!(

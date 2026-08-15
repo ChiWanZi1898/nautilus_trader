@@ -23,14 +23,17 @@ use std::{collections::HashSet, sync::Arc};
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{HasTsInit, custom::CustomDataTrait},
-    identifiers::InstrumentId,
+    identifiers::{InstrumentId, Symbol},
     types::Price,
 };
 use nautilus_persistence_macros::custom_data;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::http::models::{GammaEvent, GammaMarket, GammaTag};
+use crate::{
+    common::consts::POLYMARKET_VENUE,
+    http::models::{GammaEvent, GammaMarket, GammaTag},
+};
 
 /// Type name published for [`PolymarketFrameCommit`] custom data.
 pub const POLYMARKET_FRAME_COMMIT_TYPE_NAME: &str = "PolymarketFrameCommit";
@@ -439,6 +442,7 @@ pub struct PolymarketEventMarketDefinition {
     question: String,
     outcomes: Vec<String>,
     token_ids: Vec<String>,
+    instrument_ids: Vec<InstrumentId>,
     active: Option<bool>,
     closed: Option<bool>,
     accepting_orders: Option<bool>,
@@ -530,6 +534,12 @@ impl PolymarketEventMarketDefinition {
     #[must_use]
     pub fn token_ids(&self) -> &[String] {
         &self.token_ids
+    }
+
+    /// Returns the source-ordered Nautilus instrument identifiers paired with [`Self::token_ids`].
+    #[must_use]
+    pub fn instrument_ids(&self) -> &[InstrumentId] {
+        &self.instrument_ids
     }
 
     /// Returns the Gamma active flag when present.
@@ -854,6 +864,15 @@ impl PolymarketEventMarketDefinition {
         );
         ensure_unique_strings(&outcomes, "market outcome")?;
         ensure_unique_strings(&token_ids, "market token id")?;
+        let instrument_ids = token_ids
+            .iter()
+            .map(|token_id| {
+                InstrumentId::new(
+                    Symbol::new(format!("{}-{token_id}", market.condition_id)),
+                    *POLYMARKET_VENUE,
+                )
+            })
+            .collect();
 
         let price_tick = market
             .order_price_min_tick_size
@@ -894,6 +913,7 @@ impl PolymarketEventMarketDefinition {
             question: market.question,
             outcomes,
             token_ids,
+            instrument_ids,
             active: market.active,
             closed: market.closed,
             accepting_orders: market.accepting_orders,
@@ -1142,17 +1162,41 @@ fn validate_event_definition(event: &PolymarketEventDefinition) -> anyhow::Resul
         }
         anyhow::ensure!(
             market.outcomes.len() <= MAX_MARKET_OUTCOMES
-                && market.token_ids.len() <= MAX_MARKET_OUTCOMES,
+                && market.token_ids.len() <= MAX_MARKET_OUTCOMES
+                && market.instrument_ids.len() <= MAX_MARKET_OUTCOMES,
             "market {} exceeds the outcome/token bound",
+            market.market_id,
+        );
+        anyhow::ensure!(
+            market.outcomes.len() == market.token_ids.len()
+                && market.token_ids.len() == market.instrument_ids.len(),
+            "market {} outcome/token/instrument vectors must align",
             market.market_id,
         );
         ensure_unique_strings(&market.outcomes, "market outcome")?;
         ensure_unique_strings(&market.token_ids, "market token id")?;
+        anyhow::ensure!(
+            market.instrument_ids.iter().collect::<HashSet<_>>().len()
+                == market.instrument_ids.len(),
+            "market {} instrument ids must be unique",
+            market.market_id,
+        );
         for outcome in &market.outcomes {
             validate_required_text("market outcome", outcome)?;
         }
         for token_id in &market.token_ids {
             validate_required_id("market token id", token_id)?;
+        }
+        for (token_id, instrument_id) in market.token_ids.iter().zip(&market.instrument_ids) {
+            let expected = InstrumentId::new(
+                Symbol::new(format!("{}-{token_id}", market.condition_id)),
+                *POLYMARKET_VENUE,
+            );
+            anyhow::ensure!(
+                *instrument_id == expected,
+                "market {} instrument id does not match condition/token identity",
+                market.market_id,
+            );
         }
         anyhow::ensure!(
             market_ids.insert(market.market_id.as_str()),
@@ -1358,6 +1402,16 @@ mod tests {
                 < (markets[1].condition_id(), markets[1].market_id())
         }));
         let first_market = &first.markets()[0];
+        for (token_id, instrument_id) in first_market
+            .token_ids()
+            .iter()
+            .zip(first_market.instrument_ids())
+        {
+            assert_eq!(
+                instrument_id.to_string(),
+                format!("{}-{token_id}.POLYMARKET", first_market.condition_id())
+            );
+        }
         assert_eq!(first_market.price_tick(), Some("0.001"));
         assert_eq!(first_market.minimum_order_size(), Some("5"));
         assert_eq!(first_market.fees_enabled(), Some(false));

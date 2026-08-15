@@ -254,7 +254,7 @@ pub struct GammaMarket {
     /// surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
     /// Events linked to this gamma market.
     pub events: Option<Vec<GammaEvent>>,
 }
@@ -369,7 +369,7 @@ pub struct GammaEvent {
     /// surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
     /// Tags attached to the complete event container.
     #[serde(default)]
     pub tags: Vec<GammaTag>,
@@ -724,7 +724,7 @@ mod tests {
 
         // one market has no game_id
         assert!(map_handicap.game_id.is_none());
-        assert_eq!(money_line.game_id, Some(1_427_074));
+        assert_eq!(money_line.game_id.as_deref(), Some("1427074"));
     }
 
     #[rstest]

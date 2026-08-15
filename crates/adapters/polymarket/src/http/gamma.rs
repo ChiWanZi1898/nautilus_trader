@@ -426,7 +426,7 @@ fn flatten_event_markets(events: Vec<GammaEvent>) -> Vec<GammaMarket> {
             let event_game_id = event.game_id;
             event.markets.into_iter().map(move |mut market| {
                 if market.game_id.is_none() {
-                    market.game_id = event_game_id;
+                    market.game_id.clone_from(&event_game_id);
                 }
                 market
             })
@@ -876,9 +876,25 @@ impl PolymarketGammaHttpClient {
                 ..base_params.clone()
             };
 
+            let inner = Arc::clone(&self.inner);
+            let cursor = after_cursor.clone();
             let response = self
-                .inner
-                .get_gamma_events_keyset(params, after_cursor.as_deref())
+                .retry_manager
+                .execute_with_retry(
+                    "gamma_fetch_events_page",
+                    || {
+                        let inner = Arc::clone(&inner);
+                        let params = params.clone();
+                        let cursor = cursor.clone();
+                        async move {
+                            inner
+                                .get_gamma_events_keyset(params, cursor.as_deref())
+                                .await
+                        }
+                    },
+                    |error| error.is_retryable(),
+                    Error::transport,
+                )
                 .await?;
             let page_len = response.events.len() as u32;
             let skipped = remaining_offset.min(page_len) as usize;
@@ -908,6 +924,7 @@ impl PolymarketGammaHttpClient {
                 "Gamma event pagination repeated cursor {next_cursor:?}",
             );
             after_cursor = Some(next_cursor);
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
         Ok(all_events)
@@ -951,8 +968,19 @@ impl PolymarketGammaHttpClient {
         let events = self.fetch_gamma_events_paginated(params).await?;
         let mut definitions = events
             .into_iter()
-            .map(PolymarketEventDefinition::try_from_gamma)
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .filter_map(|event| {
+                let event_id = event.id.clone();
+                match PolymarketEventDefinition::try_from_gamma(event) {
+                    Ok(definition) => Some(definition),
+                    Err(error) => {
+                        log::warn!(
+                            "Rejected incomplete Gamma event definition {event_id}: {error}"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
         definitions.sort_by(|a, b| a.event_id().cmp(b.event_id()));
         anyhow::ensure!(
             definitions

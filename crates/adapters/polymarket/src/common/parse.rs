@@ -24,14 +24,12 @@ use serde::{Deserialize, Deserializer, de::Error};
 
 use crate::common::enums::PolymarketOrderSide;
 
-/// Deserializes a Polymarket game ID. The Gamma API returns the field in two
-/// shapes (string on `GammaMarket`, integer on `GammaEvent`) and uses both
-/// `null` and `-1` (or `"-1"`) as the "no game" sentinel for non-sport
-/// markets. Either sentinel is mapped to `None`; valid values must be
-/// non-negative.
+/// Deserializes a Polymarket game ID. Gamma returns numeric and opaque string IDs and uses both
+/// `null` and `-1` (or `"-1"`) as the "no game" sentinel for non-sport markets. The retained
+/// string is descriptive metadata; consumers requiring the legacy numeric form parse it later.
 pub fn deserialize_optional_polymarket_game_id<'de, D>(
     deserializer: D,
-) -> Result<Option<u64>, D::Error>
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -46,12 +44,22 @@ where
     match raw {
         None => Ok(None),
         Some(Raw::Str(s)) if s.is_empty() || s == "-1" => Ok(None),
-        Some(Raw::Str(s)) => s.parse::<u64>().map(Some).map_err(D::Error::custom),
+        Some(Raw::Str(s)) => {
+            if s.len() > 128
+                || s.trim() != s
+                || !s.bytes().all(|byte| byte.is_ascii_graphic())
+                || s.strip_prefix('-')
+                    .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
+            {
+                return Err(D::Error::custom("game_id must be bounded visible ASCII"));
+            }
+            Ok(Some(s))
+        }
         Some(Raw::Int(-1)) => Ok(None),
         Some(Raw::Int(i)) if i < 0 => Err(D::Error::custom(format!(
             "negative game_id {i}: only -1 is recognized as the no-game sentinel"
         ))),
-        Some(Raw::Int(i)) => Ok(Some(i as u64)),
+        Some(Raw::Int(i)) => Ok(Some(i.to_string())),
     }
 }
 
@@ -109,7 +117,7 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct GameIdHolder {
         #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-        game_id: Option<u64>,
+        game_id: Option<String>,
     }
 
     #[rstest]
@@ -118,21 +126,25 @@ mod tests {
     #[case::empty_string(r#"{"game_id": ""}"#, None)]
     #[case::int_neg_one(r#"{"game_id": -1}"#, None)]
     #[case::str_neg_one(r#"{"game_id": "-1"}"#, None)]
-    #[case::int_zero(r#"{"game_id": 0}"#, Some(0))]
-    #[case::str_zero(r#"{"game_id": "0"}"#, Some(0))]
-    #[case::int_value(r#"{"game_id": 1427074}"#, Some(1_427_074))]
-    #[case::str_value(r#"{"game_id": "1427074"}"#, Some(1_427_074))]
+    #[case::int_zero(r#"{"game_id": 0}"#, Some("0".to_string()))]
+    #[case::str_zero(r#"{"game_id": "0"}"#, Some("0".to_string()))]
+    #[case::int_value(r#"{"game_id": 1427074}"#, Some("1427074".to_string()))]
+    #[case::str_value(r#"{"game_id": "1427074"}"#, Some("1427074".to_string()))]
+    #[case::opaque_value(
+        r#"{"game_id": "game-f90d9d85"}"#,
+        Some("game-f90d9d85".to_string())
+    )]
     fn test_deserialize_optional_polymarket_game_id(
         #[case] payload: &str,
-        #[case] expected: Option<u64>,
+        #[case] expected: Option<String>,
     ) {
         let holder: GameIdHolder = serde_json::from_str(payload).unwrap();
         assert_eq!(holder.game_id, expected);
     }
 
     #[rstest]
-    fn test_deserialize_optional_polymarket_game_id_rejects_garbage_string() {
-        let err = serde_json::from_str::<GameIdHolder>(r#"{"game_id": "not-a-number"}"#);
+    fn test_deserialize_optional_polymarket_game_id_rejects_noncanonical_string() {
+        let err = serde_json::from_str::<GameIdHolder>(r#"{"game_id": " not-canonical"}"#);
         assert!(err.is_err());
     }
 

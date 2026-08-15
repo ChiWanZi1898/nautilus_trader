@@ -85,55 +85,59 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
         POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME,
     );
 
-    let restored =
-        <PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(serde_json::json!({
-            "events": [{
-                "event_id": "event-1",
-                "slug": "temperature-event",
-                "title": "Temperature event",
-                "category": "weather",
-                "start_date": null,
-                "end_date": null,
+    let value = serde_json::json!({
+        "events": [{
+            "event_id": "event-1",
+            "slug": "temperature-event",
+            "title": "Temperature event",
+            "category": "weather",
+            "start_date": null,
+            "end_date": null,
+            "active": true,
+            "closed": false,
+            "archived": false,
+            "restricted": false,
+            "enable_order_book": true,
+            "enable_neg_risk": true,
+            "neg_risk": true,
+            "neg_risk_market_id": "neg-risk-1",
+            "tags": [{"id": "tag-1", "label": "Weather", "slug": "weather"}],
+            "markets": [{
+                "market_id": "market-1",
+                "condition_id": "condition-1",
+                "question_id": "question-1",
+                "market_slug": "condition-1",
+                "question": "Will the temperature exceed 20C?",
+                "outcomes": ["Yes", "No"],
+                "token_ids": ["yes-token", "no-token"],
+                "instrument_ids": [
+                    "condition-1-yes-token.POLYMARKET",
+                    "condition-1-no-token.POLYMARKET"
+                ],
                 "active": true,
                 "closed": false,
-                "archived": false,
-                "restricted": false,
+                "accepting_orders": true,
                 "enable_order_book": true,
-                "enable_neg_risk": true,
                 "neg_risk": true,
                 "neg_risk_market_id": "neg-risk-1",
-                "tags": [{"id": "tag-1", "label": "Weather", "slug": "weather"}],
-                "markets": [{
-                    "market_id": "market-1",
-                    "condition_id": "condition-1",
-                    "question_id": "question-1",
-                    "market_slug": "condition-1",
-                    "question": "Will the temperature exceed 20C?",
-                    "outcomes": ["Yes", "No"],
-                    "token_ids": ["yes-token", "no-token"],
-                    "active": true,
-                    "closed": false,
-                    "accepting_orders": true,
-                    "enable_order_book": true,
-                    "neg_risk": true,
-                    "neg_risk_market_id": "neg-risk-1",
-                    "neg_risk_other": false,
-                    "group_item_title": "20C",
-                    "group_item_threshold": "20",
-                    "price_tick": "0.001",
-                    "minimum_order_size": "5",
-                    "fees_enabled": true,
-                    "fee_schedule": {
-                        "rate": "0.05",
-                        "exponent": "1",
-                        "taker_only": true,
-                        "rebate_rate": "0.25"
-                    }
-                }]
-            }],
-            "ts_event": 42,
-            "ts_init": 42
-        }))
+                "neg_risk_other": false,
+                "group_item_title": "20C",
+                "group_item_threshold": "20",
+                "price_tick": "0.001",
+                "minimum_order_size": "5",
+                "fees_enabled": true,
+                "fee_schedule": {
+                    "rate": "0.05",
+                    "exponent": "1",
+                    "taker_only": true,
+                    "rebate_rate": "0.25"
+                }
+            }]
+        }],
+        "ts_event": 42,
+        "ts_init": 42
+    });
+    let restored = <PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(value.clone())
         .expect("validated public JSON contract");
     let snapshot = restored
         .as_any()
@@ -146,6 +150,10 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
         ["yes-token", "no-token"]
     );
     let market = &snapshot.events()[0].markets()[0];
+    assert_eq!(
+        market.instrument_ids()[0].to_string(),
+        "condition-1-yes-token.POLYMARKET"
+    );
     assert_eq!(market.price_tick(), Some("0.001"));
     assert_eq!(market.minimum_order_size(), Some("5"));
     assert_eq!(market.fees_enabled(), Some(true));
@@ -154,4 +162,9 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
     assert_eq!(schedule.exponent(), "1");
     assert!(schedule.taker_only());
     assert_eq!(schedule.rebate_rate(), "0.25");
+
+    let mut tampered = value;
+    tampered["events"][0]["markets"][0]["instrument_ids"][0] =
+        serde_json::Value::String("foreign-token.POLYMARKET".to_string());
+    assert!(<PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(tampered).is_err());
 }

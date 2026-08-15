@@ -225,7 +225,7 @@ fn request_event_definition_snapshot(client: &PolymarketDataClient, request: Req
             .is_some_and(|params| !params.is_empty())
     {
         log::error!(
-            "Polymarket event definition snapshots require an unfiltered full-universe request"
+            "Polymarket event definition snapshots use the adapter-owned complete weather scope"
         );
         return;
     }
@@ -250,6 +250,7 @@ fn request_event_definition_snapshot(client: &PolymarketDataClient, request: Req
             active: Some(true),
             closed: Some(false),
             archived: Some(false),
+            tag_slug: Some("weather".to_string()),
             max_events: Some(10_001),
             ..Default::default()
         };
