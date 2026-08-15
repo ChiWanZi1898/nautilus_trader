@@ -41,8 +41,13 @@ use ustr::Ustr;
 
 use crate::{
     common::{
-        consts::{LOT_SIZE_SCALE, POLYMARKET_NAUTILUS_BUILDER_CODE, USDC_DECIMALS},
-        enums::{PolymarketOrderSide, PolymarketOrderType, SignatureType},
+        consts::{
+            LOT_SIZE_SCALE, POLYMARKET_NAUTILUS_BUILDER_CODE, POLYMARKET_ZERO_BUILDER_CODE,
+            USDC_DECIMALS,
+        },
+        enums::{
+            PolymarketBuilderAttribution, PolymarketOrderSide, PolymarketOrderType, SignatureType,
+        },
     },
     http::models::PolymarketOrder,
     signing::eip712::{OrderSigner, order_hash},
@@ -62,6 +67,7 @@ pub struct PolymarketOrderBuilder {
     signer_address: String,
     maker_address: String,
     signature_type: SignatureType,
+    builder_attribution: PolymarketBuilderAttribution,
     last_timestamp_ms: AtomicU64,
 }
 
@@ -73,11 +79,29 @@ impl PolymarketOrderBuilder {
         maker_address: String,
         signature_type: SignatureType,
     ) -> Self {
+        Self::new_with_builder_attribution(
+            order_signer,
+            signer_address,
+            maker_address,
+            signature_type,
+            PolymarketBuilderAttribution::Nautilus,
+        )
+    }
+
+    /// Creates a new [`PolymarketOrderBuilder`] with explicit builder attribution.
+    pub fn new_with_builder_attribution(
+        order_signer: OrderSigner,
+        signer_address: String,
+        maker_address: String,
+        signature_type: SignatureType,
+        builder_attribution: PolymarketBuilderAttribution,
+    ) -> Self {
         Self {
             order_signer,
             signer_address,
             maker_address,
             signature_type,
+            builder_attribution,
             last_timestamp_ms: AtomicU64::new(0),
         }
     }
@@ -305,7 +329,11 @@ impl PolymarketOrderBuilder {
             expiration: expiration.to_string(),
             timestamp: timestamp_ms.to_string(),
             metadata: ZERO_BYTES32.to_string(),
-            builder: POLYMARKET_NAUTILUS_BUILDER_CODE.to_string(),
+            builder: match self.builder_attribution {
+                PolymarketBuilderAttribution::Nautilus => POLYMARKET_NAUTILUS_BUILDER_CODE,
+                PolymarketBuilderAttribution::None => POLYMARKET_ZERO_BUILDER_CODE,
+            }
+            .to_string(),
             signature: String::new(),
         };
 
@@ -714,6 +742,22 @@ mod tests {
         PolymarketOrderBuilder::new(signer, addr.clone(), addr, SignatureType::Eoa)
     }
 
+    fn make_test_builder_without_attribution() -> PolymarketOrderBuilder {
+        let pk = EvmPrivateKey::new(
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+        )
+        .unwrap();
+        let signer = OrderSigner::new(&pk).unwrap();
+        let addr = format!("{:#x}", signer.address());
+        PolymarketOrderBuilder::new_with_builder_attribution(
+            signer,
+            addr.clone(),
+            addr,
+            SignatureType::Eoa,
+            PolymarketBuilderAttribution::None,
+        )
+    }
+
     #[rstest]
     fn test_next_timestamp_ms_is_strictly_monotonic() {
         let builder = make_test_builder();
@@ -757,6 +801,10 @@ mod tests {
     #[rstest]
     fn test_built_order_carries_nautilus_builder_code() {
         let builder = make_test_builder();
+        assert_eq!(
+            builder.builder_attribution,
+            PolymarketBuilderAttribution::Nautilus
+        );
         let order = builder
             .build_limit_order(
                 "71321045679252212594626385532706912750332728571942532289631379312455583992563",
@@ -770,6 +818,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(order.builder, POLYMARKET_NAUTILUS_BUILDER_CODE);
+        assert_eq!(
+            builder.expected_order_id(&order, false).unwrap().as_str(),
+            format!("{:#x}", order_hash(&order, false).unwrap())
+        );
+    }
+
+    #[rstest]
+    fn test_built_order_without_attribution_signs_zero_builder_identity() {
+        let builder = make_test_builder_without_attribution();
+        let order = builder
+            .build_limit_order(
+                "71321045679252212594626385532706912750332728571942532289631379312455583992563",
+                PolymarketOrderSide::Buy,
+                dec!(0.50),
+                dec!(10),
+                PolymarketOrderType::GTC,
+                "0",
+                false,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(order.builder, POLYMARKET_ZERO_BUILDER_CODE);
+        assert!(!order.signature.is_empty());
+        assert_eq!(
+            builder.expected_order_id(&order, false).unwrap().as_str(),
+            format!("{:#x}", order_hash(&order, false).unwrap())
+        );
     }
 
     #[rstest]

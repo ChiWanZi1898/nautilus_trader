@@ -439,6 +439,7 @@ pub fn polymarket(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(stringify!(POLYMARKET_CLIENT_ID), *POLYMARKET_CLIENT_ID)?;
     m.add(stringify!(POLYMARKET_VENUE), *POLYMARKET_VENUE)?;
     m.add_class::<crate::common::enums::SignatureType>()?;
+    m.add_class::<crate::common::enums::PolymarketBuilderAttribution>()?;
     m.add_class::<PolymarketUpDownEventSlugConfig>()?;
     m.add_class::<PolymarketInstrumentProviderConfig>()?;
     m.add_class::<PolymarketDataClientConfig>()?;

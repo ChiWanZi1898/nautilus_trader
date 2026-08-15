@@ -19,7 +19,7 @@ use nautilus_network::websocket::TransportBackend;
 use pyo3::{PyResult, pymethods};
 
 use crate::{
-    common::enums::SignatureType,
+    common::enums::{PolymarketBuilderAttribution, SignatureType},
     config::{
         PolymarketDataClientConfig, PolymarketExecClientConfig, PolymarketInstrumentProviderConfig,
         PolymarketUpDownEventSlugConfig,
@@ -227,7 +227,7 @@ impl PolymarketExecClientConfig {
     /// derive list.
     #[new]
     #[expect(clippy::too_many_arguments)]
-    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None))]
+    #[pyo3(signature = (trader_id=None, account_id=None, private_key=None, api_key=None, api_secret=None, passphrase=None, funder=None, signature_type=None, base_url_http=None, base_url_ws=None, base_url_data_api=None, http_timeout_secs=None, max_retries=None, retry_delay_initial_ms=None, retry_delay_max_ms=None, heartbeat_enabled=None, transport_backend=None, proxy_url=None, builder_attribution=None))]
     fn py_new(
         trader_id: Option<String>,
         account_id: Option<String>,
@@ -247,6 +247,7 @@ impl PolymarketExecClientConfig {
         heartbeat_enabled: Option<bool>,
         transport_backend: Option<TransportBackend>,
         proxy_url: Option<String>,
+        builder_attribution: Option<PolymarketBuilderAttribution>,
     ) -> PyResult<Self> {
         let default = Self::default();
         let config = Self {
@@ -258,6 +259,7 @@ impl PolymarketExecClientConfig {
             passphrase,
             funder,
             signature_type: signature_type.unwrap_or(default.signature_type),
+            builder_attribution: builder_attribution.unwrap_or(default.builder_attribution),
             base_url_http,
             base_url_ws,
             base_url_data_api,

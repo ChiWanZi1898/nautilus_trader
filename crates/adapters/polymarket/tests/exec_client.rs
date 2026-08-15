@@ -78,8 +78,12 @@ use nautilus_model::{
 use nautilus_network::http::HttpClient;
 use nautilus_polymarket::{
     common::{
-        consts::{POLYMARKET_CLIENT_ID, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM, POLYMARKET_VENUE},
-        enums::SignatureType,
+        consts::{
+            POLYMARKET_CLIENT_ID, POLYMARKET_NAUTILUS_BUILDER_CODE,
+            POLYMARKET_PREPARE_ALL_OR_NONE_PARAM, POLYMARKET_VENUE,
+            POLYMARKET_ZERO_BUILDER_CODE,
+        },
+        enums::{PolymarketBuilderAttribution, SignatureType},
     },
     config::PolymarketExecClientConfig,
     execution::PolymarketExecutionClient,
@@ -4215,6 +4219,127 @@ async fn test_submit_order_list_posts_batch_and_accepts_orders(#[case] prepare_a
             "signed order missing `signature`"
         );
     }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_none_builder_attribution_signs_single_order_with_zero_builder() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-NO-BUILDER-SINGLE",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let body = state.last_body.lock().await.clone().unwrap();
+    let signed_order: PolymarketOrder =
+        serde_json::from_value(body.get("order").unwrap().clone()).unwrap();
+    assert_eq!(signed_order.builder, POLYMARKET_ZERO_BUILDER_CODE);
+    assert!(order_hash(&signed_order, false).is_ok());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_none_builder_attribution_drives_prepare_all_batch_correlation() {
+    let state = TestServerState::default();
+    *state.batch_order_response.lock().await = Some(json!([
+        {"success": true, "orderID": "$expected:1", "errorMsg": ""},
+        {"success": true, "orderID": "$expected:0", "errorMsg": ""}
+    ]));
+    let addr = start_mock_server(state.clone()).await;
+    let mut config = create_test_exec_config(addr);
+    config.builder_attribution = PolymarketBuilderAttribution::None;
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let orders = [
+        make_limit_order(
+            "O-NO-BUILDER-BATCH-1",
+            instrument_id,
+            OrderSide::Buy,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+        make_limit_order(
+            "O-NO-BUILDER-BATCH-2",
+            instrument_id,
+            OrderSide::Sell,
+            false,
+            false,
+            false,
+            TimeInForce::Gtc,
+        ),
+    ];
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    client
+        .submit_order_list(make_submit_order_list_cmd_with_params(
+            instrument_id,
+            &orders,
+            Some(prepare_all_or_none_params(true)),
+        ))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    let accepted = [
+        assert_order_event(recv_execution_event(&mut rx).await, "Accepted"),
+        assert_order_event(recv_execution_event(&mut rx).await, "Accepted"),
+    ];
+
+    let body = state.last_body.lock().await.clone().unwrap();
+    let expected_ids = expected_batch_order_ids(&body);
+    assert_eq!(expected_ids.len(), orders.len());
+    for entry in body.as_array().unwrap() {
+        let signed_order: PolymarketOrder =
+            serde_json::from_value(entry.get("order").unwrap().clone()).unwrap();
+        assert_eq!(signed_order.builder, POLYMARKET_ZERO_BUILDER_CODE);
+        assert_ne!(signed_order.builder, POLYMARKET_NAUTILUS_BUILDER_CODE);
+    }
+    for (event, expected_id) in accepted.iter().zip(&expected_ids) {
+        let OrderEventAny::Accepted(event) = event else {
+            unreachable!("accepted events asserted above")
+        };
+        assert_eq!(event.venue_order_id.as_str(), expected_id);
+    }
+    assert_eq!(*state.batch_order_post_count.lock().await, 1);
 }
 
 #[rstest]

@@ -31,7 +31,10 @@ use nautilus_network::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    common::{enums::SignatureType, urls},
+    common::{
+        enums::{PolymarketBuilderAttribution, SignatureType},
+        urls,
+    },
     filters::InstrumentFilter,
 };
 
@@ -517,6 +520,9 @@ pub struct PolymarketExecClientConfig {
     pub funder: Option<String>,
     #[builder(default = SignatureType::Eoa)]
     pub signature_type: SignatureType,
+    /// Builder attribution embedded in every signed order.
+    #[builder(default)]
+    pub builder_attribution: PolymarketBuilderAttribution,
     pub base_url_http: Option<String>,
     pub base_url_ws: Option<String>,
     pub base_url_data_api: Option<String>,
@@ -544,6 +550,7 @@ nautilus_core::impl_pyo3_config_getters!(PolymarketExecClientConfig {
     account_id: AccountId,
     funder: Option<String>,
     signature_type: SignatureType,
+    builder_attribution: PolymarketBuilderAttribution,
     base_url_http: Option<String>,
     base_url_ws: Option<String>,
     base_url_data_api: Option<String>,
@@ -566,6 +573,7 @@ impl Debug for PolymarketExecClientConfig {
             .field("passphrase", &"***")
             .field("funder", &self.funder)
             .field("signature_type", &self.signature_type)
+            .field("builder_attribution", &self.builder_attribution)
             .field("base_url_http", &self.base_url_http)
             .field("base_url_ws", &self.base_url_ws)
             .field("base_url_data_api", &self.base_url_data_api)
@@ -764,10 +772,25 @@ log_warnings = false
         assert_eq!(config.trader_id, expected.trader_id);
         assert_eq!(config.account_id, expected.account_id);
         assert_eq!(config.signature_type, expected.signature_type);
+        assert_eq!(
+            config.builder_attribution,
+            PolymarketBuilderAttribution::Nautilus
+        );
         assert_eq!(config.http_timeout_secs, expected.http_timeout_secs);
         assert_eq!(config.max_retries, expected.max_retries);
         assert!(!config.heartbeat_enabled);
         assert_eq!(config.transport_backend, expected.transport_backend);
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_accepts_no_builder_attribution() {
+        let config: PolymarketExecClientConfig =
+            toml::from_str("builder_attribution = \"none\"").unwrap();
+
+        assert_eq!(
+            config.builder_attribution,
+            PolymarketBuilderAttribution::None
+        );
     }
 
     #[rstest]

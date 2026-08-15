@@ -36,6 +36,10 @@ pub static POLYMARKET_CLIENT_ID: LazyLock<ClientId> =
 pub const POLYMARKET_NAUTILUS_BUILDER_CODE: &str =
     "0x4f2c0bba608033563f74b82300e2ed59f54f8d0de08281031f03fb2c62819e63";
 
+/// Zero `bytes32` used when builder attribution is explicitly disabled.
+pub const POLYMARKET_ZERO_BUILDER_CODE: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
+
 pub const PUSD: &str = "pUSD";
 
 pub const MAX_PRICE: &str = "0.999";

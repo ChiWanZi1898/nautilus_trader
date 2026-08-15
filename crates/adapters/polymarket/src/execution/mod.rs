@@ -158,11 +158,12 @@ impl PolymarketExecutionClient {
 
         let order_signer =
             OrderSigner::new(&secrets.private_key).context("failed to create order signer")?;
-        let order_builder = Arc::new(PolymarketOrderBuilder::new(
+        let order_builder = Arc::new(PolymarketOrderBuilder::new_with_builder_attribution(
             order_signer,
             signer_address,
             maker_address,
             config.signature_type,
+            config.builder_attribution,
         ));
 
         let retry_config = RetryConfig {

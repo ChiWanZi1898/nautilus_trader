@@ -50,6 +50,34 @@ pub enum SignatureType {
     Poly1271 = 3,
 }
 
+/// Builder attribution embedded in signed Polymarket orders.
+///
+/// [`Self::Nautilus`] preserves the upstream adapter payload. [`Self::None`]
+/// writes a zero `bytes32`, which Polymarket treats as no builder attribution.
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        frozen,
+        eq,
+        hash,
+        module = "nautilus_trader.core.nautilus_pyo3.polymarket",
+        from_py_object,
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.polymarket")
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolymarketBuilderAttribution {
+    /// Attribute orders to the pinned Nautilus builder code.
+    #[default]
+    Nautilus,
+    /// Do not attribute orders to a builder.
+    None,
+}
+
 /// Outcome label for a Polymarket market token.
 ///
 /// Free-form string from the API (e.g. "Yes", "No", "Up", "Down").
