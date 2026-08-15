@@ -50,6 +50,7 @@ pub mod config;
 pub mod data;
 pub mod data_types;
 pub mod evidence;
+pub mod evidence_v2;
 pub mod execution;
 pub mod factories;
 pub mod filters;
