@@ -521,6 +521,17 @@ impl PolymarketClobHttpClient {
         order_type: PolymarketOrderType,
         post_only: bool,
     ) -> Result<OrderResponse> {
+        let body_bytes = self.prepare_order_body(order, order_type, post_only)?;
+        self.post_prepared_order_body(body_bytes).await
+    }
+
+    /// Serializes one signed order into the exact bytes authenticated and sent by [`Self::post_order`].
+    pub(crate) fn prepare_order_body(
+        &self,
+        order: &PolymarketOrder,
+        order_type: PolymarketOrderType,
+        post_only: bool,
+    ) -> Result<Vec<u8>> {
         let owner = self.credential.api_key().to_string();
         let body = PostOrderBody {
             order,
@@ -528,7 +539,14 @@ impl PolymarketClobHttpClient {
             order_type,
             post_only,
         };
-        let body_bytes = serde_json::to_vec(&body).map_err(Error::Serde)?;
+        serde_json::to_vec(&body).map_err(Error::Serde)
+    }
+
+    /// Sends an already serialized single-order body without reserializing it.
+    pub(crate) async fn post_prepared_order_body(
+        &self,
+        body_bytes: Vec<u8>,
+    ) -> Result<OrderResponse> {
         self.send_post(PATH_POST_ORDER, body_bytes, 1).await
     }
 
@@ -539,6 +557,16 @@ impl PolymarketClobHttpClient {
         &self,
         orders: &[(&PolymarketOrder, PolymarketOrderType, bool)],
     ) -> Result<Vec<OrderResponse>> {
+        let body_bytes = self.prepare_orders_body(orders)?;
+        self.post_prepared_orders_body(body_bytes, orders.len())
+            .await
+    }
+
+    /// Serializes signed orders into the exact bytes authenticated and sent by [`Self::post_orders`].
+    pub(crate) fn prepare_orders_body(
+        &self,
+        orders: &[(&PolymarketOrder, PolymarketOrderType, bool)],
+    ) -> Result<Vec<u8>> {
         let owner = self.credential.api_key().to_string();
         let entries: Vec<PostOrderBody<'_>> = orders
             .iter()
@@ -549,8 +577,16 @@ impl PolymarketClobHttpClient {
                 post_only: *post_only,
             })
             .collect();
-        let body_bytes = serde_json::to_vec(&entries).map_err(Error::Serde)?;
-        let cost = batch_cost(PATH_POST_ORDERS, entries.len())?;
+        serde_json::to_vec(&entries).map_err(Error::Serde)
+    }
+
+    /// Sends an already serialized batch-order body without reserializing it.
+    pub(crate) async fn post_prepared_orders_body(
+        &self,
+        body_bytes: Vec<u8>,
+        order_count: usize,
+    ) -> Result<Vec<OrderResponse>> {
+        let cost = batch_cost(PATH_POST_ORDERS, order_count)?;
         self.send_post(PATH_POST_ORDERS, body_bytes, cost).await
     }
 

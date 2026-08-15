@@ -33,7 +33,7 @@ use std::{
 use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{OrderSide, TimeInForce},
-    identifiers::VenueOrderId,
+    identifiers::{ClientOrderId, VenueOrderId},
     types::Quantity,
 };
 use nautilus_network::retry::{RetryConfig, RetryManager};
@@ -42,7 +42,10 @@ use rust_decimal::Decimal;
 use super::{
     order_builder::PolymarketOrderBuilder,
     parse::{adjust_market_buy_amount, calculate_market_price},
-    types::{LimitOrderSubmitRequest, SignedLimitOrderSubmission},
+    types::{
+        LimitHttpRequestEndpoint, LimitOrderSubmitRequest, PreparedLimitHttpRequest,
+        SignedLimitOrderSubmission,
+    },
 };
 use crate::{
     common::enums::{PolymarketOrderSide, PolymarketOrderType},
@@ -408,12 +411,80 @@ impl OrderSubmitter {
         })
     }
 
-    pub(crate) async fn post_limit_order_submission(
+    pub(crate) fn prepare_single_limit_http_request(
         &self,
-        submission: SignedLimitOrderSubmission,
+        submission: &SignedLimitOrderSubmission,
+        client_order_id: ClientOrderId,
+    ) -> anyhow::Result<PreparedLimitHttpRequest> {
+        let body_bytes = self
+            .http_client
+            .prepare_order_body(
+                &submission.order,
+                submission.order_type,
+                submission.post_only,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to serialize single LIMIT request: {error}")
+            })?;
+        PreparedLimitHttpRequest::new(
+            LimitHttpRequestEndpoint::Single,
+            body_bytes,
+            vec![submission.expected_venue_order_id],
+            vec![client_order_id],
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) fn prepare_batch_limit_http_request(
+        &self,
+        submissions: &[SignedLimitOrderSubmission],
+        client_order_ids: Vec<ClientOrderId>,
+    ) -> anyhow::Result<PreparedLimitHttpRequest> {
+        let order_refs: Vec<(&PolymarketOrder, PolymarketOrderType, bool)> = submissions
+            .iter()
+            .map(|submission| {
+                (
+                    &submission.order,
+                    submission.order_type,
+                    submission.post_only,
+                )
+            })
+            .collect();
+        let body_bytes = self
+            .http_client
+            .prepare_orders_body(&order_refs)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize batch LIMIT request: {error}"))?;
+        let expected_venue_order_ids = submissions
+            .iter()
+            .map(|submission| submission.expected_venue_order_id)
+            .collect();
+        PreparedLimitHttpRequest::new(
+            LimitHttpRequestEndpoint::Batch,
+            body_bytes,
+            expected_venue_order_ids,
+            client_order_ids,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    pub(crate) async fn post_prepared_single_limit_request(
+        &self,
+        prepared: PreparedLimitHttpRequest,
     ) -> crate::http::error::Result<OrderResponse> {
+        if prepared.endpoint() != LimitHttpRequestEndpoint::Single {
+            return Err(Error::bad_request(
+                "prepared LIMIT request endpoint mismatch: expected single",
+            ));
+        }
+        if !prepared.body_hash_matches() {
+            return Err(Error::bad_request(
+                "prepared single LIMIT request body hash mismatch",
+            ));
+        }
+
         let http_client = self.http_client.clone();
         let saw_unknown_outcome = Arc::new(AtomicBool::new(false));
+        let prepared = Arc::new(prepared);
 
         let result = self
             .retry_manager
@@ -421,16 +492,10 @@ impl OrderSubmitter {
                 "submit_limit_order",
                 || {
                     let http_client = http_client.clone();
-                    let submission = submission.clone();
+                    let body_bytes = prepared.body_bytes().to_vec();
                     let saw_unknown_outcome = saw_unknown_outcome.clone();
                     async move {
-                        let result = http_client
-                            .post_order(
-                                &submission.order,
-                                submission.order_type,
-                                submission.post_only,
-                            )
-                            .await;
+                        let result = http_client.post_prepared_order_body(body_bytes).await;
 
                         if result.as_ref().is_err_and(Error::is_submit_outcome_unknown) {
                             saw_unknown_outcome.store(true, Ordering::Release);
@@ -452,25 +517,28 @@ impl OrderSubmitter {
         }
     }
 
-    pub(crate) async fn post_limit_order_submissions(
+    pub(crate) async fn post_prepared_batch_limit_request(
         &self,
-        submissions: Vec<SignedLimitOrderSubmission>,
+        prepared: PreparedLimitHttpRequest,
     ) -> crate::http::error::Result<Vec<OrderResponse>> {
-        let order_refs: Vec<(&PolymarketOrder, PolymarketOrderType, bool)> = submissions
-            .iter()
-            .map(|submission| {
-                (
-                    &submission.order,
-                    submission.order_type,
-                    submission.post_only,
-                )
-            })
-            .collect();
+        if prepared.endpoint() != LimitHttpRequestEndpoint::Batch {
+            return Err(Error::bad_request(
+                "prepared LIMIT request endpoint mismatch: expected batch",
+            ));
+        }
+        if !prepared.body_hash_matches() {
+            return Err(Error::bad_request(
+                "prepared batch LIMIT request body hash mismatch",
+            ));
+        }
+        let order_count = prepared.expected_venue_order_ids().len();
 
         // Do not retry batch submits automatically.
         // A transport timeout can race with server-side acceptance and resubmit
         // the whole batch without an idempotency key we can verify here.
-        self.http_client.post_orders(&order_refs).await
+        self.http_client
+            .post_prepared_orders_body(prepared.into_body_bytes(), order_count)
+            .await
     }
 }
 

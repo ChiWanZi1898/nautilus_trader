@@ -177,6 +177,8 @@ impl RequestGate {
 #[derive(Clone)]
 struct TestServerState {
     last_body: Arc<tokio::sync::Mutex<Option<Value>>>,
+    order_raw_bodies: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    batch_order_raw_bodies: Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
     last_headers: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     last_path: Arc<tokio::sync::Mutex<String>>,
     last_query: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
@@ -226,6 +228,8 @@ impl Default for TestServerState {
     fn default() -> Self {
         Self {
             last_body: Arc::new(tokio::sync::Mutex::new(None)),
+            order_raw_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            batch_order_raw_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             last_headers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
             last_query: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -463,6 +467,7 @@ async fn handle_post_order(
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     *state.order_post_count.lock().await += 1;
+    state.order_raw_bodies.lock().await.push(body.to_vec());
 
     if let Ok(v) = serde_json::from_slice::<Value>(&body) {
         *state.last_body.lock().await = Some(v);
@@ -504,6 +509,11 @@ async fn handle_post_orders(
         let mut count = state.batch_order_post_count.lock().await;
         *count += 1;
     }
+    state
+        .batch_order_raw_bodies
+        .lock()
+        .await
+        .push(body.to_vec());
 
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let expected_order_ids = parsed
@@ -3892,6 +3902,12 @@ async fn test_submit_order_retries_5xx_and_accepts_when_recovered() {
 
     // Three POSTs total: two failed retries plus the recovered call.
     assert_eq!(*state.order_post_count.lock().await, 3);
+    let raw_bodies = state.order_raw_bodies.lock().await;
+    assert_eq!(raw_bodies.len(), 3);
+    assert!(
+        raw_bodies.windows(2).all(|pair| pair[0] == pair[1]),
+        "same-identity retries must send byte-identical prepared bodies"
+    );
 }
 
 #[rstest]
@@ -4326,6 +4342,12 @@ async fn test_none_builder_attribution_drives_prepare_all_batch_correlation() {
     ];
 
     let body = state.last_body.lock().await.clone().unwrap();
+    let raw_bodies = state.batch_order_raw_bodies.lock().await;
+    assert_eq!(raw_bodies.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw_bodies[0]).unwrap(),
+        body
+    );
     let expected_ids = expected_batch_order_ids(&body);
     assert_eq!(expected_ids.len(), orders.len());
     for entry in body.as_array().unwrap() {

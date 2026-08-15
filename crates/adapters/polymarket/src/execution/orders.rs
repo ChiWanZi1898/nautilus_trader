@@ -39,7 +39,7 @@ use super::{
         reject_submit_order,
     },
     submitter::{MarketBuyFeeContext, MarketOrderSubmitRequest, UnknownSubmitError},
-    types::{BatchLimitOrderContext, LimitOrderSubmitRequest},
+    types::{BatchLimitOrderContext, LimitOrderSubmitRequest, PreparedLimitHttpRequest},
 };
 use crate::common::consts::{BATCH_ORDER_LIMIT, POLYMARKET_PREPARE_ALL_OR_NONE_PARAM};
 
@@ -58,6 +58,15 @@ fn deny_prepare_all_or_none_batch(
     for order in orders {
         emitter.emit_order_denied(order, reason);
     }
+}
+
+fn prepared_request_matches_orders(
+    prepared: &PreparedLimitHttpRequest,
+    orders: &[BatchLimitOrderContext],
+) -> bool {
+    prepared.client_order_ids().iter().copied().eq(orders
+        .iter()
+        .map(|batch_order| batch_order.order.client_order_id()))
 }
 
 impl PolymarketExecutionClient {
@@ -123,7 +132,17 @@ impl PolymarketExecutionClient {
                 }
             };
 
-            let expected_venue_order_id = submission.expected_venue_order_id;
+            let prepared_request = match submitter
+                .prepare_single_limit_http_request(&submission, order.client_order_id())
+            {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    reject_submit_order(&order, &format!("{e}"), &emitter, clock, &pending_cancels);
+                    return Ok(());
+                }
+            };
+
+            let expected_venue_order_id = prepared_request.expected_venue_order_ids()[0];
             let mut activation = if pre_activate_expected_order_ids {
                 match activate_expected_submit(
                     &order,
@@ -150,7 +169,10 @@ impl PolymarketExecutionClient {
             if let Some(activation) = &mut activation {
                 activation.mark_http_handoff_started();
             }
-            match submitter.post_limit_order_submission(submission).await {
+            match submitter
+                .post_prepared_single_limit_request(prepared_request)
+                .await
+            {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
@@ -704,6 +726,40 @@ impl PolymarketExecutionClient {
                 return Ok(());
             }
 
+            let mut prepared_all_request = if prepare_all_or_none {
+                let client_order_ids = prepared_orders
+                    .iter()
+                    .map(|batch_order| batch_order.order.client_order_id())
+                    .collect();
+                let result = if submissions.len() == 1 {
+                    submitter.prepare_single_limit_http_request(
+                        &submissions[0],
+                        prepared_orders[0].order.client_order_id(),
+                    )
+                } else {
+                    submitter.prepare_batch_limit_http_request(&submissions, client_order_ids)
+                };
+                match result {
+                    Ok(prepared) if prepared_request_matches_orders(&prepared, &prepared_orders) => {
+                        Some(prepared)
+                    }
+                    Ok(_) => {
+                        let reason = "Prepare-all-or-none exact HTTP request identity ordering mismatch; no orders were submitted";
+                        deny_prepare_all_or_none_batch(&emitter, &plan_orders, reason);
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let reason = format!(
+                            "Prepare-all-or-none exact HTTP request preparation failed; no orders were submitted: {error}"
+                        );
+                        deny_prepare_all_or_none_batch(&emitter, &plan_orders, &reason);
+                        return Ok(());
+                    }
+                }
+            } else {
+                None
+            };
+
             let mut activations: Vec<ExpectedSubmitActivation> =
                 Vec::with_capacity(submissions.len());
             if pre_activate_expected_order_ids {
@@ -747,10 +803,33 @@ impl PolymarketExecutionClient {
 
                 if submissions_chunk.len() == 1 {
                     let submission = submissions_chunk.pop().expect("len 1");
-                    let expected_venue_order_id = submission.expected_venue_order_id;
                     let batch_order = orders_chunk.pop().expect("len 1");
+                    let prepared_request = if let Some(prepared) = prepared_all_request.take() {
+                        prepared
+                    } else {
+                        match submitter.prepare_single_limit_http_request(
+                            &submission,
+                            batch_order.order.client_order_id(),
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                reject_submit_order(
+                                    &batch_order.order,
+                                    &format!("{error}"),
+                                    &emitter,
+                                    clock,
+                                    &pending_cancels,
+                                );
+                                offset = end;
+                                continue;
+                            }
+                        }
+                    };
+                    let expected_venue_order_id = prepared_request.expected_venue_order_ids()[0];
                     handle_single_order_response(
-                        submitter.post_limit_order_submission(submission).await,
+                        submitter
+                            .post_prepared_single_limit_request(prepared_request)
+                            .await,
                         batch_order,
                         expected_venue_order_id,
                         &submitter,
@@ -764,13 +843,55 @@ impl PolymarketExecutionClient {
                     )
                     .await;
                 } else {
-                    let expected_venue_order_ids: Vec<VenueOrderId> = submissions_chunk
-                        .iter()
-                        .map(|submission| submission.expected_venue_order_id)
-                        .collect();
+                    let prepared_request = if let Some(prepared) = prepared_all_request.take() {
+                        prepared
+                    } else {
+                        let client_order_ids = orders_chunk
+                            .iter()
+                            .map(|batch_order| batch_order.order.client_order_id())
+                            .collect();
+                        match submitter.prepare_batch_limit_http_request(
+                            &submissions_chunk,
+                            client_order_ids,
+                        ) {
+                            Ok(prepared)
+                                if prepared_request_matches_orders(&prepared, &orders_chunk) =>
+                            {
+                                prepared
+                            }
+                            Ok(_) => {
+                                for batch_order in orders_chunk {
+                                    reject_submit_order(
+                                        &batch_order.order,
+                                        "Prepared HTTP request identity ordering mismatch",
+                                        &emitter,
+                                        clock,
+                                        &pending_cancels,
+                                    );
+                                }
+                                offset = end;
+                                continue;
+                            }
+                            Err(error) => {
+                                for batch_order in orders_chunk {
+                                    reject_submit_order(
+                                        &batch_order.order,
+                                        &format!("{error}"),
+                                        &emitter,
+                                        clock,
+                                        &pending_cancels,
+                                    );
+                                }
+                                offset = end;
+                                continue;
+                            }
+                        }
+                    };
+                    let expected_venue_order_ids =
+                        prepared_request.expected_venue_order_ids().to_vec();
 
                     match submitter
-                        .post_limit_order_submissions(submissions_chunk)
+                        .post_prepared_batch_limit_request(prepared_request)
                         .await
                     {
                         Ok(responses) => {
