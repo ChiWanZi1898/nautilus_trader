@@ -434,6 +434,11 @@ impl FeedHandler {
                                     message: PolymarketWsMessage::Reconnected,
                                 });
                             }
+                            // Heartbeats are transport liveness, never authenticated economic
+                            // evidence. Consume them before the strict durable V2 projection.
+                            if text == "PONG" || text == "NO NEW ASSETS" {
+                                continue;
+                            }
                             let msgs = if self.channel == WsChannel::User
                                 && let Some(bridge) = &self.evidence_bridge
                             {
@@ -747,6 +752,36 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(bridge.frames.lock().await.len(), 1);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn authenticated_heartbeat_is_consumed_before_durable_projection() {
+        let bridge = Arc::new(TestFrameBridge::default());
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
+        raw_tx
+            .send((0, Message::Text("PONG".to_string().into())))
+            .expect("send heartbeat");
+        raw_tx
+            .send((
+                0,
+                Message::Text(
+                    include_str!("../../test_data/ws_user_batch_msg.json")
+                        .to_string()
+                        .into(),
+                ),
+            ))
+            .expect("send user frame");
+
+        assert!(matches!(
+            handler.next().await,
+            Some(PolymarketConnectionMessage {
+                message: PolymarketWsMessage::User(_),
+                ..
+            })
+        ));
+        assert!(!handler.is_stopped());
         assert_eq!(bridge.frames.lock().await.len(), 1);
     }
 
