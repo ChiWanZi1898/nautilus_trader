@@ -281,6 +281,12 @@ impl FeedHandler {
     }
 
     fn parse_messages(&self, text: &str) -> Vec<PolymarketWsMessage> {
+        // Market and user channels respond to the required text `PING` heartbeat
+        // with the exact text `PONG`; it is transport liveness, not market data.
+        if text == "PONG" {
+            return vec![];
+        }
+
         // When `subscribe_new_markets` is enabled, Polymarket's WSS periodically
         // sends the plain-text string "NO NEW ASSETS" as a heartbeat/ack.
         if text == "NO NEW ASSETS" {
@@ -847,6 +853,15 @@ mod tests {
             messages[0],
             PolymarketWsMessage::MalformedMarketFrame
         ));
+    }
+
+    #[rstest]
+    fn text_heartbeat_response_is_not_parsed_as_market_or_user_data(
+        market_handler: FeedHandler,
+        user_handler: FeedHandler,
+    ) {
+        assert!(market_handler.parse_messages("PONG").is_empty());
+        assert!(user_handler.parse_messages("PONG").is_empty());
     }
 
     #[rstest]
