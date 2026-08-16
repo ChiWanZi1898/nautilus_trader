@@ -122,6 +122,7 @@ pub(crate) struct OrderSubmitter {
     http_client: PolymarketClobHttpClient,
     order_builder: Arc<PolymarketOrderBuilder>,
     retry_manager: Arc<RetryManager<Error>>,
+    retry_submits: bool,
 }
 
 impl OrderSubmitter {
@@ -130,10 +131,12 @@ impl OrderSubmitter {
         order_builder: Arc<PolymarketOrderBuilder>,
         retry_config: RetryConfig,
     ) -> Self {
+        let retry_submits = retry_config.max_retries > 0;
         Self {
             http_client,
             order_builder,
             retry_manager: Arc::new(RetryManager::new(retry_config)),
+            retry_submits,
         }
     }
 
@@ -481,6 +484,13 @@ impl OrderSubmitter {
             return Err(Error::bad_request(
                 "prepared single LIMIT request body hash mismatch",
             ));
+        }
+
+        if !self.retry_submits {
+            return self
+                .http_client
+                .post_prepared_order_body(prepared.into_body_bytes())
+                .await;
         }
 
         let http_client = self.http_client.clone();

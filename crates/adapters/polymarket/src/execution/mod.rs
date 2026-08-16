@@ -15,6 +15,7 @@
 
 //! Live execution client implementation for the Polymarket adapter.
 
+pub mod latency;
 pub mod order_builder;
 pub mod parse;
 

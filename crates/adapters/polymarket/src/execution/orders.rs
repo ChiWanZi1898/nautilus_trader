@@ -25,11 +25,13 @@ use nautilus_model::{
     types::{Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
+use std::time::Instant;
 
 use super::{
     PolymarketExecutionClient,
     activation::{ExpectedSubmitActivation, activate_expected_submit},
     cancellations::execute_deferred_cancel,
+    latency::record_limit_submit_latency,
     order_builder::PolymarketOrderBuilder,
     parse::{compute_commission, instrument_fee_exponent, instrument_taker_fee},
     reports::fetch_collateral_balance_pusd,
@@ -52,6 +54,10 @@ use crate::{
         PolymarketSubmitPrepared,
     },
 };
+
+fn duration_ns(start: Instant, end: Instant) -> u64 {
+    u64::try_from(end.duration_since(start).as_nanos()).unwrap_or(u64::MAX)
+}
 
 fn requires_prepare_all_or_none(cmd: &SubmitOrderList) -> bool {
     cmd.params
@@ -123,6 +129,7 @@ async fn append_mutation_evidence(
 
 impl PolymarketExecutionClient {
     pub(super) fn submit_limit_order(&self, order: OrderAny) {
+        let command_received_at = Instant::now();
         if let Err(reason) = PolymarketOrderBuilder::validate_limit_order(&order) {
             self.emitter.emit_order_denied(&order, &reason);
             return;
@@ -177,6 +184,7 @@ impl PolymarketExecutionClient {
         let evidence_bridge = self.evidence_bridge.clone();
 
         self.spawn_task("submit_limit_order", async move {
+            let task_started_at = Instant::now();
             let submission = match submitter.prepare_limit_order_submission(&request).await {
                 Ok(submission) => submission,
                 Err(e) => {
@@ -184,6 +192,7 @@ impl PolymarketExecutionClient {
                     return Ok(());
                 }
             };
+            let signed_at = Instant::now();
 
             let prepared_request = match submitter
                 .prepare_single_limit_http_request(&submission, order.client_order_id())
@@ -194,6 +203,7 @@ impl PolymarketExecutionClient {
                     return Ok(());
                 }
             };
+            let encoded_at = Instant::now();
 
             let prepared_evidence = if let Some(bridge) = &evidence_bridge {
                 let evidence = match build_submit_prepared_evidence(
@@ -289,10 +299,19 @@ impl PolymarketExecutionClient {
             if let Some(activation) = &mut activation {
                 activation.mark_http_handoff_started();
             }
-            match submitter
+            let http_started_at = Instant::now();
+            let response = submitter
                 .post_prepared_single_limit_request(prepared_request)
-                .await
-            {
+                .await;
+            let http_finished_at = Instant::now();
+            record_limit_submit_latency(
+                duration_ns(command_received_at, task_started_at),
+                duration_ns(task_started_at, signed_at),
+                duration_ns(signed_at, encoded_at),
+                duration_ns(encoded_at, http_started_at),
+                duration_ns(http_started_at, http_finished_at),
+            );
+            match response {
                 Ok(response) => {
                     if let Some((order_id_str, venue_order_id)) = handle_order_response(
                         Ok(response),
@@ -610,6 +629,7 @@ impl PolymarketExecutionClient {
     }
 
     pub(super) fn submit_order_list_command(&self, cmd: &SubmitOrderList) {
+        let command_received_at = Instant::now();
         let mut batch_orders = Vec::with_capacity(cmd.order_inits.len());
         let prepare_all_or_none = requires_prepare_all_or_none(cmd);
         let mut plan_orders = Vec::with_capacity(cmd.order_inits.len());
@@ -803,6 +823,7 @@ impl PolymarketExecutionClient {
         let evidence_bridge = self.evidence_bridge.clone();
 
         self.spawn_task("submit_order_list", async move {
+            let task_started_at = Instant::now();
             if !prepare_all_or_none {
                 for batch_order in &batch_orders {
                     emitter.emit_order_submitted(&batch_order.order);
@@ -812,6 +833,7 @@ impl PolymarketExecutionClient {
             let requests: Vec<LimitOrderSubmitRequest> =
                 batch_orders.iter().map(|bo| bo.request.clone()).collect();
             let prepare_results = submitter.prepare_limit_order_submissions(&requests).await;
+            let signed_at = Instant::now();
 
             if prepare_all_or_none
                 && let Some((failed_index, error)) = prepare_results
@@ -886,6 +908,7 @@ impl PolymarketExecutionClient {
             } else {
                 None
             };
+            let encoded_at = Instant::now();
 
             let prepared_evidence = if let (Some(bridge), Some(prepared_request)) =
                 (&evidence_bridge, &prepared_all_request)
@@ -1022,10 +1045,22 @@ impl PolymarketExecutionClient {
                         }
                     };
                     let expected_venue_order_id = prepared_request.expected_venue_order_ids()[0];
+                    let http_started_at = Instant::now();
+                    let response = submitter
+                        .post_prepared_single_limit_request(prepared_request)
+                        .await;
+                    let http_finished_at = Instant::now();
+                    if prepare_all_or_none {
+                        record_limit_submit_latency(
+                            duration_ns(command_received_at, task_started_at),
+                            duration_ns(task_started_at, signed_at),
+                            duration_ns(signed_at, encoded_at),
+                            duration_ns(encoded_at, http_started_at),
+                            duration_ns(http_started_at, http_finished_at),
+                        );
+                    }
                     handle_single_order_response(
-                        submitter
-                            .post_prepared_single_limit_request(prepared_request)
-                            .await,
+                        response,
                         batch_order,
                         expected_venue_order_id,
                         &submitter,
@@ -1086,10 +1121,21 @@ impl PolymarketExecutionClient {
                     let expected_venue_order_ids =
                         prepared_request.expected_venue_order_ids().to_vec();
 
-                    match submitter
+                    let http_started_at = Instant::now();
+                    let response = submitter
                         .post_prepared_batch_limit_request(prepared_request)
-                        .await
-                    {
+                        .await;
+                    let http_finished_at = Instant::now();
+                    if prepare_all_or_none {
+                        record_limit_submit_latency(
+                            duration_ns(command_received_at, task_started_at),
+                            duration_ns(task_started_at, signed_at),
+                            duration_ns(signed_at, encoded_at),
+                            duration_ns(encoded_at, http_started_at),
+                            duration_ns(http_started_at, http_finished_at),
+                        );
+                    }
+                    match response {
                         Ok(responses) => {
                             handle_batch_order_responses(
                                 responses,
