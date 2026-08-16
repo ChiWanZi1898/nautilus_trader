@@ -560,11 +560,13 @@ pub struct MarketUnsubscribeRequest {
 
 /// User-channel subscribe request sent on connect.
 ///
-/// Wire format: `{"auth": {...}, "markets": [], "assets_ids": [], "type": "user"}`
+/// Wire format: `{"auth": {...}, "type": "user"}` when no market filter is requested.
 #[derive(Debug, Serialize)]
 pub struct UserSubscribeRequest {
     pub auth: PolymarketWsAuth,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub markets: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assets_ids: Vec<String>,
     #[serde(rename = "type")]
     pub msg_type: &'static str,
@@ -589,6 +591,28 @@ mod tests {
     fn load_text(filename: &str) -> String {
         let path = format!("test_data/{filename}");
         std::fs::read_to_string(path).expect("Failed to read test data")
+    }
+
+    #[test]
+    fn user_subscription_omits_empty_filters_per_documented_wire_shape() {
+        let request = UserSubscribeRequest {
+            auth: PolymarketWsAuth {
+                api_key: "key".to_string(),
+                secret: "secret".to_string(),
+                passphrase: "passphrase".to_string(),
+            },
+            markets: Vec::new(),
+            assets_ids: Vec::new(),
+            msg_type: "user",
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("user")
+        );
+        assert!(value.get("auth").is_some());
+        assert!(value.get("markets").is_none());
+        assert!(value.get("assets_ids").is_none());
     }
 
     #[rstest]
