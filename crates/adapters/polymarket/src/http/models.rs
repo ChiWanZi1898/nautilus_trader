@@ -453,9 +453,39 @@ pub struct DataApiPosition {
     pub asset: String,
     #[serde(alias = "conditionId", alias = "condition_id")]
     pub condition_id: String,
+    #[serde(deserialize_with = "deserialize_decimal_number")]
     pub size: Decimal,
-    #[serde(alias = "avgPrice", alias = "avg_price")]
+    #[serde(
+        alias = "avgPrice",
+        alias = "avg_price",
+        deserialize_with = "deserialize_optional_decimal_number"
+    )]
     pub avg_price: Option<Decimal>,
+}
+
+fn deserialize_decimal_number<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let number = serde_json::Number::deserialize(deserializer)?;
+    number
+        .to_string()
+        .parse::<Decimal>()
+        .map_err(D::Error::custom)
+}
+
+fn deserialize_optional_decimal_number<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(|number| {
+            number
+                .to_string()
+                .parse::<Decimal>()
+                .map_err(D::Error::custom)
+        })
+        .transpose()
 }
 
 /// A trade from the Polymarket Data API `GET /trades` endpoint.
@@ -931,6 +961,16 @@ mod tests {
         // Dust position (below DUST_POSITION_THRESHOLD)
         assert_eq!(positions[3].size, dec!(0.005));
         assert_eq!(positions[3].avg_price, Some(dec!(0.7)));
+    }
+
+    #[rstest]
+    fn test_data_api_position_accepts_integer_size_without_float_conversion() {
+        let position: DataApiPosition =
+            serde_json::from_str(r#"{"asset":"1","conditionId":"0x1","size":5,"avgPrice":0.98}"#)
+                .unwrap();
+
+        assert_eq!(position.size, dec!(5));
+        assert_eq!(position.avg_price, Some(dec!(0.98)));
     }
 
     #[rstest]
