@@ -43,7 +43,8 @@ use crate::{
     evidence::PolymarketEvidenceBridge,
 };
 
-const POLYMARKET_HEARTBEAT_SECS: u64 = 30;
+const POLYMARKET_HEARTBEAT_SECS: u64 = 10;
+const POLYMARKET_HEARTBEAT_MESSAGE: &str = "PING";
 
 /// Polymarket WebSocket channel: market data or authenticated user data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,7 +445,7 @@ impl PolymarketWebSocketClient {
             url: self.url.clone(),
             headers: vec![],
             heartbeat: Some(POLYMARKET_HEARTBEAT_SECS),
-            heartbeat_msg: None,
+            heartbeat_msg: Some(POLYMARKET_HEARTBEAT_MESSAGE.to_string()),
             reconnect_timeout_ms: Some(15_000),
             reconnect_delay_initial_ms: Some(250),
             reconnect_delay_max_ms: Some(5_000),
@@ -884,7 +885,10 @@ mod tests {
         let assert_common = |config: &WebSocketConfig| {
             assert_eq!(config.headers, Vec::<(String, String)>::new());
             assert_eq!(config.heartbeat, Some(super::POLYMARKET_HEARTBEAT_SECS));
-            assert_eq!(config.heartbeat_msg, None);
+            assert_eq!(
+                config.heartbeat_msg.as_deref(),
+                Some(super::POLYMARKET_HEARTBEAT_MESSAGE)
+            );
             assert_eq!(config.reconnect_timeout_ms, Some(15_000));
             assert_eq!(config.reconnect_delay_initial_ms, Some(250));
             assert_eq!(config.reconnect_delay_max_ms, Some(5_000));
