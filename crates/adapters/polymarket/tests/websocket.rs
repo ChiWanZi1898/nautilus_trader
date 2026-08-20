@@ -1015,7 +1015,12 @@ async fn pool_shards_assets_across_two_connections_at_cap() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
     let pool = connect_market_pool(addr, false, 200).await;
-    wait_for_connection_count(&state, 1, Duration::from_secs(5)).await;
+    assert_eq!(
+        pool.connection_count(),
+        0,
+        "without discovery, connect must not open an empty market socket",
+    );
+    assert_eq!(*state.connection_count.lock().await, 0);
 
     let assets: Vec<String> = (0..250).map(|i| format!("asset-{i}")).collect();
     pool.handle()
@@ -1029,6 +1034,58 @@ async fn pool_shards_assets_across_two_connections_at_cap() {
     wait_for_unique_subscribed_count(&state, 250, Duration::from_secs(5)).await;
 
     pool.disconnect().await.expect("disconnect failed");
+}
+
+// Without new-market discovery, the first real asset subscription opens the
+// primary shard. This avoids Polymarket rejecting an idle empty market socket
+// while instrument discovery is still running.
+#[rstest]
+#[tokio::test]
+async fn pool_defers_primary_until_first_asset_subscription() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let pool = connect_market_pool(addr, false, 200).await;
+
+    assert_eq!(pool.connection_count(), 0);
+    assert_eq!(*state.connection_count.lock().await, 0);
+
+    pool.handle()
+        .subscribe_market(vec!["asset-a".to_string()])
+        .await
+        .expect("first subscribe opens primary");
+
+    assert_eq!(pool.connection_count(), 1);
+    wait_for_connection_count(&state, 1, Duration::from_secs(5)).await;
+    wait_for_unique_subscribed_count(&state, 1, Duration::from_secs(5)).await;
+
+    pool.disconnect().await.expect("disconnect failed");
+}
+
+// A failed eager discovery connection must not leave the pool looking initialized;
+// the next connect call must perform another real connection attempt.
+#[rstest]
+#[tokio::test]
+async fn pool_eager_connect_failure_can_be_retried() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("reserve unused address");
+    let addr = listener.local_addr().expect("unused address");
+    drop(listener);
+
+    let pool = PolymarketMarketConnectionPool::new(
+        Some(format!("ws://{addr}/ws/market")),
+        true,
+        TransportBackend::default(),
+        200,
+    );
+
+    assert!(pool.connect().await.is_err(), "first connection must fail");
+    assert_eq!(pool.connection_count(), 0);
+    assert!(
+        pool.connect().await.is_err(),
+        "retry must make a fresh connection attempt, not return already-connected Ok",
+    );
+    assert_eq!(pool.connection_count(), 0);
 }
 
 // A universe below the cap stays on a single connection.

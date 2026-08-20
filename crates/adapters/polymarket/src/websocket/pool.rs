@@ -21,11 +21,13 @@
 //! more than `ws_max_subscriptions` assets. See [`WS_DEFAULT_SUBSCRIPTIONS`] for
 //! why that bound exists.
 //!
-//! The pool grows lazily: it starts with one shard and opens another only when the
-//! current shards are full at subscribe time. A secondary shard closes once it owns
-//! no assets; the primary shard (which carries new-market discovery) always
-//! persists. Each shard replays only its own subscriptions on reconnect because
-//! that state lives inside its own [`PolymarketWebSocketClient`].
+//! The pool grows lazily. When new-market discovery is disabled, even the primary
+//! shard is deferred until the first real asset subscription, so Polymarket never
+//! sees an idle market socket with no subscription payload. When discovery is
+//! enabled, the primary opens eagerly to carry that feed. A secondary shard closes
+//! once it owns no assets; the primary always persists. Each shard replays only its
+//! own subscriptions on reconnect because that state lives inside its own
+//! [`PolymarketWebSocketClient`].
 
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -195,22 +197,25 @@ impl PolymarketMarketConnectionPool {
         }
     }
 
-    /// Opens the primary shard and prepares the merged message stream.
+    /// Prepares the merged message stream and opens the primary shard when needed.
+    ///
+    /// New-market discovery requires an eager primary connection. Otherwise the
+    /// first real asset subscription opens the primary lazily, preventing an empty
+    /// market socket from timing out while instrument discovery is still running.
     ///
     /// # Errors
     ///
-    /// Returns an error if the primary connection cannot be established.
+    /// Returns an error if an eager primary connection cannot be established.
     pub async fn connect(&self) -> anyhow::Result<()> {
         let _wire = self.inner.wire_mutex.lock().await;
 
         if !self.inner.closed.load(Ordering::Acquire)
-            && !self
+            && self
                 .inner
-                .state
+                .out_tx
                 .lock()
-                .expect("pool state mutex poisoned")
-                .shards
-                .is_empty()
+                .expect("pool out_tx mutex poisoned")
+                .is_some()
         {
             log::warn!("Polymarket market pool already connected");
             return Ok(());
@@ -235,7 +240,22 @@ impl PolymarketMarketConnectionPool {
             state.next_shard_id = PRIMARY_SHARD_ID + 1;
         }
 
-        self.inner.connect_new_shard(true).await?;
+        if self.inner.subscribe_new_markets
+            && let Err(error) = self.inner.connect_new_shard(true).await
+        {
+            self.inner.closed.store(true, Ordering::Release);
+            *self
+                .inner
+                .out_tx
+                .lock()
+                .expect("pool out_tx mutex poisoned") = None;
+            *self
+                .inner
+                .out_rx
+                .lock()
+                .expect("pool out_rx mutex poisoned") = None;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -518,7 +538,13 @@ impl PoolInner {
             }
         }
 
-        let id = self.connect_new_shard(false).await?;
+        let is_primary = self
+            .state
+            .lock()
+            .expect("pool state mutex poisoned")
+            .shards
+            .is_empty();
+        let id = self.connect_new_shard(is_primary).await?;
 
         let mut state = self.state.lock().expect("pool state mutex poisoned");
         let handle = {
