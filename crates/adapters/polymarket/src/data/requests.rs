@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use futures_util::{StreamExt, stream};
 use nautilus_common::{
     live::get_runtime,
     messages::{
@@ -27,7 +28,7 @@ use nautilus_common::{
         },
     },
 };
-use nautilus_core::datetime::datetime_to_unix_nanos;
+use nautilus_core::{Params, datetime::datetime_to_unix_nanos};
 use nautilus_model::{data::CustomData, instruments::Instrument};
 
 use super::{
@@ -36,7 +37,9 @@ use super::{
 use crate::{
     common::consts::POLYMARKET_VENUE,
     data_types::{
-        POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketEventDefinitionSnapshot,
+        POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME,
+        POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketClobMarketInfoSnapshot,
+        PolymarketEventDefinitionSnapshot,
     },
     http::query::GetGammaEventsParams,
     providers::extract_condition_id,
@@ -48,7 +51,14 @@ use crate::{
     },
 };
 
+const MAX_CLOB_MARKET_INFO_CONDITIONS: usize = 2_000;
+const MAX_CLOB_CONDITION_ID_BYTES: usize = 512;
+
 pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustomData) {
+    if request.data_type.type_name() == POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME {
+        request_clob_market_info_snapshot(client, request);
+        return;
+    }
     if request.data_type.type_name() == POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME {
         request_event_definition_snapshot(client, request);
         return;
@@ -213,6 +223,148 @@ pub(super) fn request_data(client: &PolymarketDataClient, request: RequestCustom
             log::error!("Failed to send resolve custom data response: {e}");
         }
     });
+}
+
+fn request_clob_market_info_snapshot(client: &PolymarketDataClient, request: RequestCustomData) {
+    if request.start.is_some() || request.end.is_some() || request.limit.is_some() {
+        log::error!(
+            "Rejected bounded Polymarket CLOB market-info request {} with range or limit",
+            request.request_id,
+        );
+        return;
+    }
+    let condition_ids = match parse_exact_clob_condition_ids(&request.params) {
+        Ok(condition_ids) => condition_ids,
+        Err(error) => {
+            log::error!(
+                "Rejected Polymarket CLOB market-info request {}: {error}",
+                request.request_id,
+            );
+            return;
+        }
+    };
+
+    let RequestCustomData {
+        data_type,
+        request_id,
+        client_id,
+        params: request_params,
+        start,
+        end,
+        ..
+    } = request;
+    let clob_client = client.clob_public_client.clone();
+    let sender = client.data_sender.clone();
+    let clock = client.clock;
+    let start_nanos = datetime_to_unix_nanos(start);
+    let end_nanos = datetime_to_unix_nanos(end);
+
+    get_runtime().spawn(async move {
+        let results = stream::iter(condition_ids.into_iter().map(|condition_id| {
+            let clob_client = clob_client.clone();
+            async move {
+                let response = clob_client
+                    .get_clob_market_info(&condition_id)
+                    .await
+                    .with_context(|| format!("CLOB market info {condition_id}"))?;
+                anyhow::ensure!(
+                    response.condition_id == condition_id,
+                    "CLOB market-info condition identity mismatch"
+                );
+                Ok::<_, anyhow::Error>(response)
+            }
+        }))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+        let responses = match results.into_iter().collect::<anyhow::Result<Vec<_>>>() {
+            Ok(responses) => responses,
+            Err(error) => {
+                log::error!("Failed Polymarket CLOB market-info request {request_id}: {error}");
+                return;
+            }
+        };
+        let ts_now = clock.get_time_ns();
+        let snapshot = match PolymarketClobMarketInfoSnapshot::try_new(responses, ts_now) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                log::error!(
+                    "Invalid Polymarket CLOB market-info response for request {request_id}: {error}"
+                );
+                return;
+            }
+        };
+        let payload = Arc::new(snapshot);
+        let custom = CustomData::new(payload, data_type.clone());
+        let response = DataResponse::Data(CustomDataResponse::new(
+            request_id,
+            client_id,
+            Some(*POLYMARKET_VENUE),
+            data_type,
+            custom,
+            start_nanos,
+            end_nanos,
+            ts_now,
+            request_params,
+        ));
+        if let Err(error) = sender.send(DataEvent::Response(response)) {
+            log::error!("Failed to send Polymarket CLOB market-info snapshot: {error}");
+        }
+    });
+}
+
+fn parse_exact_clob_condition_ids(params: &Option<Params>) -> anyhow::Result<Vec<String>> {
+    let params = params
+        .as_ref()
+        .context("missing exact condition selector")?;
+    anyhow::ensure!(!params.is_empty(), "missing exact condition selector");
+    anyhow::ensure!(
+        params
+            .keys()
+            .all(|key| key == "condition_id" || key == "condition_ids"),
+        "unsupported market-info request parameter",
+    );
+
+    let mut condition_ids = Vec::new();
+    if let Some(value) = params.get("condition_id") {
+        let value = value.as_str().context("condition_id must be a string")?;
+        condition_ids.push(value.to_string());
+    }
+    if let Some(value) = params.get("condition_ids") {
+        match value {
+            serde_json::Value::String(value) => condition_ids.push(value.clone()),
+            serde_json::Value::Array(values) => {
+                anyhow::ensure!(
+                    values.len() <= MAX_CLOB_MARKET_INFO_CONDITIONS,
+                    "condition_ids exceeds the raw request bound",
+                );
+                for value in values {
+                    condition_ids.push(
+                        value
+                            .as_str()
+                            .context("every condition_ids entry must be a string")?
+                            .to_string(),
+                    );
+                }
+            }
+            _ => anyhow::bail!("condition_ids must be a string or array of strings"),
+        }
+    }
+    anyhow::ensure!(
+        !condition_ids.is_empty() && condition_ids.len() <= MAX_CLOB_MARKET_INFO_CONDITIONS,
+        "market-info request requires 1..={MAX_CLOB_MARKET_INFO_CONDITIONS} condition ids",
+    );
+    for condition_id in &condition_ids {
+        anyhow::ensure!(
+            !condition_id.is_empty()
+                && condition_id.len() <= MAX_CLOB_CONDITION_ID_BYTES
+                && condition_id.trim() == condition_id,
+            "condition id is empty, non-canonical, or exceeds the text bound",
+        );
+    }
+    condition_ids.sort();
+    condition_ids.dedup();
+    Ok(condition_ids)
 }
 
 fn request_event_definition_snapshot(client: &PolymarketDataClient, request: RequestCustomData) {
@@ -545,4 +697,47 @@ pub(super) fn request_trades(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod clob_market_info_request_tests {
+    use nautilus_core::Params;
+    use rstest::rstest;
+
+    use super::{MAX_CLOB_MARKET_INFO_CONDITIONS, parse_exact_clob_condition_ids};
+
+    #[rstest]
+    fn exact_condition_selectors_are_canonicalized() {
+        let mut params = Params::new();
+        params.insert("condition_id".to_string(), serde_json::json!("0x02"));
+        params.insert(
+            "condition_ids".to_string(),
+            serde_json::json!(["0x02", "0x01"]),
+        );
+
+        assert_eq!(
+            parse_exact_clob_condition_ids(&Some(params)).expect("exact selectors"),
+            ["0x01".to_string(), "0x02".to_string()],
+        );
+    }
+
+    #[rstest]
+    fn malformed_selector_is_not_partially_accepted() {
+        let mut params = Params::new();
+        params.insert("condition_id".to_string(), serde_json::json!("0x01"));
+        params.insert("condition_ids".to_string(), serde_json::json!(["0x02", 3]));
+
+        assert!(parse_exact_clob_condition_ids(&Some(params)).is_err());
+    }
+
+    #[rstest]
+    fn raw_selector_count_is_bounded_before_deduplication() {
+        let mut params = Params::new();
+        params.insert(
+            "condition_ids".to_string(),
+            serde_json::json!(vec!["0x01"; MAX_CLOB_MARKET_INFO_CONDITIONS + 1]),
+        );
+
+        assert!(parse_exact_clob_condition_ids(&Some(params)).is_err());
+    }
 }

@@ -1280,9 +1280,11 @@ mod tests {
         },
         config::PolymarketDataClientConfig,
         data_types::{
+            POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME,
             POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, PolymarketBookReadiness,
             PolymarketBookReadinessReason, PolymarketBookReadinessState,
-            PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
+            PolymarketClobMarketInfoSnapshot, PolymarketEventDefinitionSnapshot,
+            PolymarketFrameCommit,
         },
         http::data_api::PolymarketDataApiHttpClient,
         resolve::{
@@ -2461,6 +2463,7 @@ mod tests {
         gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
         gamma_events_response: Arc<tokio::sync::Mutex<Option<Value>>>,
         clob_market_by_condition: Arc<tokio::sync::Mutex<AHashMap<String, Value>>>,
+        clob_info_by_condition: Arc<tokio::sync::Mutex<AHashMap<String, Value>>>,
         market_payloads: Arc<tokio::sync::Mutex<Vec<Value>>>,
         market_cache_probe: Arc<StdMutex<Option<CacheProbe>>>,
         market_cache_at_connect: Arc<StdMutex<Vec<bool>>>,
@@ -2506,6 +2509,21 @@ mod tests {
         }
     }
 
+    async fn handle_clob_market_info(
+        State(state): State<TestServerState>,
+        Path(condition_id): Path<String>,
+    ) -> (StatusCode, Json<Value>) {
+        let body = state.clob_info_by_condition.lock().await;
+        if let Some(value) = body.get(&condition_id) {
+            (StatusCode::OK, Json(value.clone()))
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error":"market info not found"})),
+            )
+        }
+    }
+
     async fn handle_market_upgrade(
         ws: WebSocketUpgrade,
         State(state): State<TestServerState>,
@@ -2537,6 +2555,7 @@ mod tests {
             .route("/markets/keyset", get(handle_gamma_markets_keyset))
             .route("/events/keyset", get(handle_gamma_events_keyset))
             .route("/markets/{condition_id}", get(handle_clob_market))
+            .route("/clob-markets/{condition_id}", get(handle_clob_market_info))
             .route("/ws/market", get(handle_market_upgrade))
             .with_state(state);
 
@@ -2880,6 +2899,75 @@ mod tests {
                 .windows(2)
                 .all(|markets| { markets[0].condition_id() < markets[1].condition_id() })
         );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn request_data_returns_correlated_exact_clob_market_info() {
+        let state = TestServerState::default();
+        state.clob_info_by_condition.lock().await.insert(
+            "0xCOND-INFO".to_string(),
+            serde_json::json!({
+                "c":"0xCOND-INFO",
+                "t":[{"t":"0xYES","o":"Yes"},{"t":"0xNO","o":"No"}],
+                "mos":5,
+                "mts":0.001,
+                "ao":true,
+                "nr":true,
+                "fd":{"r":0.05,"e":1,"to":true},
+                "v":"v1"
+            }),
+        );
+        let addr = start_mock_server(state).await;
+        let (client, mut data_rx) = create_test_client(addr);
+        let mut params = Params::new();
+        params.insert(
+            "condition_ids".to_string(),
+            serde_json::json!(["0xCOND-INFO"]),
+        );
+        let request = RequestCustomData::new(
+            ClientId::from("POLYMARKET"),
+            DataType::new(POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME, None, None),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(params),
+        );
+
+        client.request_data(request).expect("request_data");
+        let events = collect_events_until(&mut data_rx, StdDuration::from_secs(2), |events| {
+            events.iter().any(|event| {
+                let DataEvent::Response(DataResponse::Data(response)) = event else {
+                    return false;
+                };
+                let Some(custom) = response.data.as_ref().downcast_ref::<ModelCustomData>() else {
+                    return false;
+                };
+                custom.data_type.type_name() == POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME
+            })
+        })
+        .await;
+        let snapshot = events
+            .iter()
+            .find_map(|event| {
+                let DataEvent::Response(DataResponse::Data(response)) = event else {
+                    return None;
+                };
+                response
+                    .data
+                    .as_ref()
+                    .downcast_ref::<ModelCustomData>()?
+                    .data
+                    .as_any()
+                    .downcast_ref::<PolymarketClobMarketInfoSnapshot>()
+            })
+            .expect("CLOB market info response");
+        assert_eq!(snapshot.markets().len(), 1);
+        assert_eq!(snapshot.markets()[0].condition_id(), "0xCOND-INFO");
+        assert_eq!(snapshot.markets()[0].minimum_tick_size(), "0.001");
+        assert_eq!(snapshot.markets()[0].fee_rate(), "0.05");
     }
 
     #[rstest]

@@ -447,6 +447,47 @@ pub struct ClobMarketResponse {
     pub tokens: Vec<ClobMarketToken>,
 }
 
+/// One token identity from CLOB V2 `GET /clob-markets/{condition_id}`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClobMarketInfoToken {
+    #[serde(rename = "t")]
+    pub token_id: String,
+    #[serde(rename = "o")]
+    pub outcome: String,
+}
+
+/// Exact CLOB V2 match-time fee curve.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClobMarketFeeDetails {
+    #[serde(rename = "r")]
+    pub rate: GammaDecimal,
+    #[serde(rename = "e")]
+    pub exponent: GammaDecimal,
+    #[serde(rename = "to")]
+    pub taker_only: bool,
+}
+
+/// Execution parameters returned by CLOB V2 `GET /clob-markets/{condition_id}`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClobMarketInfoResponse {
+    #[serde(rename = "c")]
+    pub condition_id: String,
+    #[serde(rename = "t")]
+    pub tokens: Vec<ClobMarketInfoToken>,
+    #[serde(rename = "mos")]
+    pub minimum_order_size: GammaDecimal,
+    #[serde(rename = "mts")]
+    pub minimum_tick_size: GammaDecimal,
+    #[serde(rename = "ao")]
+    pub accepting_orders: bool,
+    #[serde(rename = "nr")]
+    pub neg_risk: bool,
+    #[serde(rename = "fd")]
+    pub fee_details: ClobMarketFeeDetails,
+    #[serde(rename = "v")]
+    pub version: String,
+}
+
 /// A position from the Polymarket Data API `GET /positions` endpoint.
 #[derive(Clone, Debug, Deserialize)]
 pub struct DataApiPosition {

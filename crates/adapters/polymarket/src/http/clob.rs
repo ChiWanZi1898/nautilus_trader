@@ -38,8 +38,8 @@ use crate::{
     http::{
         error::{Error, Result},
         models::{
-            ClobBookResponse, ClobMarketResponse, FeeRateResponse, PolymarketOpenOrder,
-            PolymarketOrder, PolymarketTradeReport, TickSizeResponse,
+            ClobBookResponse, ClobMarketInfoResponse, ClobMarketResponse, FeeRateResponse,
+            PolymarketOpenOrder, PolymarketOrder, PolymarketTradeReport, TickSizeResponse,
         },
         query::{
             BalanceAllowance, BatchCancelResponse, CancelMarketOrdersParams, CancelResponse,
@@ -716,6 +716,25 @@ impl PolymarketClobPublicClient {
     /// Fetches a single market by condition ID from the CLOB API.
     pub async fn get_market(&self, condition_id: &str) -> Result<ClobMarketResponse> {
         let url = format!("{}/markets/{condition_id}", self.base_url);
+        let response = self
+            .client
+            .request_with_params(Method::GET, url, None::<&()>, None, None, None, None)
+            .await
+            .map_err(Error::from_http_client)?;
+
+        if response.status.is_success() {
+            serde_json::from_slice(&response.body).map_err(Error::Serde)
+        } else {
+            Err(Error::from_status_code(
+                response.status.as_u16(),
+                &response.body,
+            ))
+        }
+    }
+
+    /// Fetches exact CLOB V2 execution parameters for one condition.
+    pub async fn get_clob_market_info(&self, condition_id: &str) -> Result<ClobMarketInfoResponse> {
+        let url = format!("{}/clob-markets/{condition_id}", self.base_url);
         let response = self
             .client
             .request_with_params(Method::GET, url, None::<&()>, None, None, None, None)

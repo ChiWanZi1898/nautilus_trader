@@ -17,9 +17,10 @@
 
 use nautilus_model::data::custom::CustomDataTrait;
 use nautilus_polymarket::data_types::{
-    POLYMARKET_BOOK_READINESS_TYPE_NAME, POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME,
-    POLYMARKET_FRAME_COMMIT_TYPE_NAME, PolymarketBookReadiness, PolymarketBookReadinessReason,
-    PolymarketBookReadinessState, PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
+    POLYMARKET_BOOK_READINESS_TYPE_NAME, POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME,
+    POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, POLYMARKET_FRAME_COMMIT_TYPE_NAME,
+    PolymarketBookReadiness, PolymarketBookReadinessReason, PolymarketBookReadinessState,
+    PolymarketClobMarketInfoSnapshot, PolymarketEventDefinitionSnapshot, PolymarketFrameCommit,
 };
 
 #[test]
@@ -167,4 +168,45 @@ fn event_definition_snapshot_is_a_public_typed_custom_data_contract() {
     tampered["events"][0]["markets"][0]["instrument_ids"][0] =
         serde_json::Value::String("foreign-token.POLYMARKET".to_string());
     assert!(<PolymarketEventDefinitionSnapshot as CustomDataTrait>::from_json(tampered).is_err());
+}
+
+#[test]
+fn clob_market_info_snapshot_is_a_public_exact_custom_data_contract() {
+    fn assert_custom_data<T: CustomDataTrait>() {}
+
+    assert_custom_data::<PolymarketClobMarketInfoSnapshot>();
+    assert_eq!(
+        <PolymarketClobMarketInfoSnapshot as CustomDataTrait>::type_name_static(),
+        POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME,
+    );
+    let value = serde_json::json!({
+        "markets": [{
+            "condition_id":"0xcondition",
+            "tokens":[{"token_id":"11","outcome":"Yes"},{"token_id":"22","outcome":"No"}],
+            "minimum_order_size":"5",
+            "minimum_tick_size":"0.001",
+            "accepting_orders":true,
+            "neg_risk":true,
+            "fee_rate":"0.05",
+            "fee_exponent":"1",
+            "taker_only":true,
+            "version":"v1"
+        }],
+        "ts_event":42,
+        "ts_init":42
+    });
+    let restored = <PolymarketClobMarketInfoSnapshot as CustomDataTrait>::from_json(value)
+        .expect("validated CLOB market info");
+    let snapshot = restored
+        .as_any()
+        .downcast_ref::<PolymarketClobMarketInfoSnapshot>()
+        .expect("public downcast");
+    let market = &snapshot.markets()[0];
+    assert_eq!(market.condition_id(), "0xcondition");
+    assert_eq!(market.minimum_tick_size(), "0.001");
+    assert_eq!(market.minimum_order_size(), "5");
+    assert_eq!(market.fee_rate(), "0.05");
+    assert_eq!(market.fee_exponent(), "1");
+    assert!(market.taker_only());
+    assert_eq!(market.tokens()[1].token_id(), "22");
 }

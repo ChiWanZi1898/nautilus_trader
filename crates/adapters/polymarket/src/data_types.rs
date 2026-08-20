@@ -32,7 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{
     common::consts::POLYMARKET_VENUE,
-    http::models::{GammaEvent, GammaMarket, GammaTag},
+    http::models::{ClobMarketInfoResponse, GammaEvent, GammaMarket, GammaTag},
 };
 
 /// Type name published for [`PolymarketFrameCommit`] custom data.
@@ -43,12 +43,15 @@ pub const POLYMARKET_BOOK_READINESS_TYPE_NAME: &str = "PolymarketBookReadiness";
 /// Type name returned for complete Gamma event-container snapshots.
 pub const POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME: &str =
     "PolymarketEventDefinitionSnapshot";
+/// Type name returned for correlated exact CLOB V2 market-parameter snapshots.
+pub const POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME: &str = "PolymarketClobMarketInfoSnapshot";
 
 const MAX_EVENT_DEFINITIONS: usize = 10_000;
 const MAX_EVENT_MARKETS: usize = 1_000;
 const MAX_EVENT_TAGS: usize = 256;
 const MAX_MARKET_OUTCOMES: usize = 64;
 const MAX_DEFINITION_TEXT_BYTES: usize = 4_096;
+const MAX_CLOB_MARKET_INFOS: usize = 2_000;
 
 /// Immutable evidence that one Polymarket market-data WebSocket frame was fully accepted.
 ///
@@ -1068,6 +1071,298 @@ impl CustomDataTrait for PolymarketEventDefinitionSnapshot {
     }
 }
 
+/// One exact source-ordered token identity from CLOB V2 market info.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketClobTokenDefinition {
+    token_id: String,
+    outcome: String,
+}
+
+impl PolymarketClobTokenDefinition {
+    /// Returns the canonical CLOB token identifier.
+    #[must_use]
+    pub fn token_id(&self) -> &str {
+        &self.token_id
+    }
+
+    /// Returns the CLOB outcome label paired with the token.
+    #[must_use]
+    pub fn outcome(&self) -> &str {
+        &self.outcome
+    }
+}
+
+/// Exact execution parameters for one CLOB V2 condition.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolymarketClobMarketInfo {
+    condition_id: String,
+    tokens: Vec<PolymarketClobTokenDefinition>,
+    minimum_order_size: String,
+    minimum_tick_size: String,
+    accepting_orders: bool,
+    neg_risk: bool,
+    fee_rate: String,
+    fee_exponent: String,
+    taker_only: bool,
+    version: String,
+}
+
+impl PolymarketClobMarketInfo {
+    fn try_from_response(response: ClobMarketInfoResponse) -> anyhow::Result<Self> {
+        let info = Self {
+            condition_id: response.condition_id,
+            tokens: response
+                .tokens
+                .into_iter()
+                .map(|token| PolymarketClobTokenDefinition {
+                    token_id: token.token_id,
+                    outcome: token.outcome,
+                })
+                .collect(),
+            minimum_order_size: canonical_decimal(
+                "clob.minimum_order_size",
+                &response.minimum_order_size,
+            )?,
+            minimum_tick_size: canonical_decimal(
+                "clob.minimum_tick_size",
+                &response.minimum_tick_size,
+            )?,
+            accepting_orders: response.accepting_orders,
+            neg_risk: response.neg_risk,
+            fee_rate: canonical_decimal("clob.fee_rate", &response.fee_details.rate)?,
+            fee_exponent: canonical_decimal("clob.fee_exponent", &response.fee_details.exponent)?,
+            taker_only: response.fee_details.taker_only,
+            version: response.version,
+        };
+        validate_clob_market_info(&info)?;
+        Ok(info)
+    }
+
+    #[must_use]
+    pub fn condition_id(&self) -> &str {
+        &self.condition_id
+    }
+
+    #[must_use]
+    pub fn tokens(&self) -> &[PolymarketClobTokenDefinition] {
+        &self.tokens
+    }
+
+    #[must_use]
+    pub fn minimum_order_size(&self) -> &str {
+        &self.minimum_order_size
+    }
+
+    #[must_use]
+    pub fn minimum_tick_size(&self) -> &str {
+        &self.minimum_tick_size
+    }
+
+    #[must_use]
+    pub const fn accepting_orders(&self) -> bool {
+        self.accepting_orders
+    }
+
+    #[must_use]
+    pub const fn neg_risk(&self) -> bool {
+        self.neg_risk
+    }
+
+    #[must_use]
+    pub fn fee_rate(&self) -> &str {
+        &self.fee_rate
+    }
+
+    #[must_use]
+    pub fn fee_exponent(&self) -> &str {
+        &self.fee_exponent
+    }
+
+    #[must_use]
+    pub const fn taker_only(&self) -> bool {
+        self.taker_only
+    }
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+}
+
+/// Correlated canonical response containing exact CLOB V2 parameters for requested conditions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PolymarketClobMarketInfoSnapshot {
+    markets: Vec<PolymarketClobMarketInfo>,
+    ts_event: UnixNanos,
+    ts_init: UnixNanos,
+}
+
+impl PolymarketClobMarketInfoSnapshot {
+    pub(crate) fn try_new(
+        responses: Vec<ClobMarketInfoResponse>,
+        ts_init: UnixNanos,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!responses.is_empty(), "CLOB market-info snapshot is empty");
+        let mut markets = responses
+            .into_iter()
+            .map(PolymarketClobMarketInfo::try_from_response)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        markets.sort_by(|left, right| left.condition_id.cmp(&right.condition_id));
+        let snapshot = Self {
+            markets,
+            ts_event: ts_init,
+            ts_init,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ts_event == self.ts_init,
+            "CLOB market-info snapshot timestamps must match"
+        );
+        anyhow::ensure!(
+            !self.markets.is_empty() && self.markets.len() <= MAX_CLOB_MARKET_INFOS,
+            "CLOB market-info snapshot violates the market bound"
+        );
+        anyhow::ensure!(
+            self.markets
+                .windows(2)
+                .all(|markets| markets[0].condition_id < markets[1].condition_id),
+            "CLOB market infos must be sorted by unique condition_id"
+        );
+        let mut token_ids = HashSet::new();
+        for market in &self.markets {
+            validate_clob_market_info(market)?;
+            for token in &market.tokens {
+                anyhow::ensure!(
+                    token_ids.insert(token.token_id.as_str()),
+                    "duplicate CLOB token id {}",
+                    token.token_id
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn markets(&self) -> &[PolymarketClobMarketInfo] {
+        &self.markets
+    }
+
+    #[must_use]
+    pub const fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+}
+
+impl<'de> Deserialize<'de> for PolymarketClobMarketInfoSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireSnapshot {
+            markets: Vec<PolymarketClobMarketInfo>,
+            ts_event: UnixNanos,
+            ts_init: UnixNanos,
+        }
+
+        let wire = WireSnapshot::deserialize(deserializer)?;
+        let snapshot = Self {
+            markets: wire.markets,
+            ts_event: wire.ts_event,
+            ts_init: wire.ts_init,
+        };
+        snapshot.validate().map_err(D::Error::custom)?;
+        Ok(snapshot)
+    }
+}
+
+impl HasTsInit for PolymarketClobMarketInfoSnapshot {
+    fn ts_init(&self) -> UnixNanos {
+        self.ts_init
+    }
+}
+
+impl CustomDataTrait for PolymarketClobMarketInfoSnapshot {
+    fn type_name(&self) -> &'static str {
+        POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn ts_event(&self) -> UnixNanos {
+        self.ts_event
+    }
+
+    fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    fn clone_arc(&self) -> Arc<dyn CustomDataTrait> {
+        Arc::new(self.clone())
+    }
+
+    fn eq_arc(&self, other: &dyn CustomDataTrait) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn type_name_static() -> &'static str {
+        POLYMARKET_CLOB_MARKET_INFO_SNAPSHOT_TYPE_NAME
+    }
+
+    fn from_json(value: serde_json::Value) -> anyhow::Result<Arc<dyn CustomDataTrait>> {
+        let snapshot = serde_json::from_value::<Self>(value)?;
+        snapshot.validate()?;
+        Ok(Arc::new(snapshot))
+    }
+}
+
+fn validate_clob_market_info(info: &PolymarketClobMarketInfo) -> anyhow::Result<()> {
+    validate_required_id("clob.condition_id", &info.condition_id)?;
+    validate_required_text("clob.version", &info.version)?;
+    anyhow::ensure!(
+        info.tokens.len() == 2,
+        "CLOB binary market must have two tokens"
+    );
+    let mut outcomes = HashSet::new();
+    let mut tokens = HashSet::new();
+    for token in &info.tokens {
+        validate_required_id("clob.token_id", &token.token_id)?;
+        validate_required_text("clob.outcome", &token.outcome)?;
+        anyhow::ensure!(
+            tokens.insert(token.token_id.as_str()),
+            "duplicate token in CLOB market info"
+        );
+        anyhow::ensure!(
+            outcomes.insert(token.outcome.to_ascii_lowercase()),
+            "duplicate outcome in CLOB market info"
+        );
+    }
+    anyhow::ensure!(
+        outcomes.contains("yes") && outcomes.contains("no"),
+        "CLOB market info must pair YES and NO"
+    );
+    anyhow::ensure!(
+        !validate_canonical_decimal("clob.minimum_order_size", &info.minimum_order_size)?.is_zero(),
+        "clob.minimum_order_size must be positive"
+    );
+    anyhow::ensure!(
+        !validate_canonical_decimal("clob.minimum_tick_size", &info.minimum_tick_size)?.is_zero(),
+        "clob.minimum_tick_size must be positive"
+    );
+    validate_canonical_decimal("clob.fee_rate", &info.fee_rate)?;
+    anyhow::ensure!(
+        !validate_canonical_decimal("clob.fee_exponent", &info.fee_exponent)?.is_zero(),
+        "clob.fee_exponent must be positive"
+    );
+    Ok(())
+}
+
 fn validate_event_definition(event: &PolymarketEventDefinition) -> anyhow::Result<()> {
     validate_required_id("event_id", &event.event_id)?;
     validate_optional_text("event.slug", event.slug.as_deref())?;
@@ -1350,6 +1645,9 @@ pub fn register_polymarket_custom_data() {
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<
         PolymarketEventDefinitionSnapshot,
     >();
+    let _ = nautilus_model::data::ensure_custom_data_json_registered::<
+        PolymarketClobMarketInfoSnapshot,
+    >();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsCryptoPrice>();
     let _ = nautilus_model::data::ensure_custom_data_json_registered::<PolymarketRtdsEquityPrice>();
 }
@@ -1361,10 +1659,10 @@ mod tests {
     use rstest::rstest;
 
     use super::{
-        PolymarketEventDefinition, PolymarketEventDefinitionSnapshot,
-        register_polymarket_custom_data,
+        PolymarketClobMarketInfoSnapshot, PolymarketEventDefinition,
+        PolymarketEventDefinitionSnapshot, register_polymarket_custom_data,
     };
-    use crate::http::models::{FeeSchedule, GammaEvent};
+    use crate::http::models::{ClobMarketInfoResponse, FeeSchedule, GammaEvent};
 
     fn gamma_events() -> Vec<GammaEvent> {
         serde_json::from_str(include_str!("../test_data/gamma_event.json"))
@@ -1375,6 +1673,70 @@ mod tests {
     fn test_register_polymarket_custom_data_is_idempotent() {
         register_polymarket_custom_data();
         register_polymarket_custom_data();
+    }
+
+    #[rstest]
+    fn clob_market_info_snapshot_retains_exact_v2_execution_parameters() {
+        let response: ClobMarketInfoResponse = serde_json::from_str(
+            r#"{
+                "c":"0xcondition",
+                "t":[{"t":"11","o":"Yes"},{"t":"22","o":"No"}],
+                "mos":5,
+                "mts":0.001,
+                "ao":true,
+                "nr":true,
+                "fd":{"r":0.0500,"e":1.0,"to":true},
+                "v":"v1"
+            }"#,
+        )
+        .expect("CLOB V2 market info");
+        let snapshot =
+            PolymarketClobMarketInfoSnapshot::try_new(vec![response], UnixNanos::from(42_u64))
+                .expect("canonical market info snapshot");
+        let market = &snapshot.markets()[0];
+        assert_eq!(market.condition_id(), "0xcondition");
+        assert_eq!(market.minimum_order_size(), "5");
+        assert_eq!(market.minimum_tick_size(), "0.001");
+        assert_eq!(market.fee_rate(), "0.05");
+        assert_eq!(market.fee_exponent(), "1");
+        assert!(market.taker_only());
+        assert!(market.accepting_orders());
+        assert!(market.neg_risk());
+        assert_eq!(market.version(), "v1");
+        assert_eq!(market.tokens()[0].outcome(), "Yes");
+        assert_eq!(market.tokens()[1].token_id(), "22");
+
+        let restored = PolymarketClobMarketInfoSnapshot::from_json(
+            serde_json::to_value(&snapshot).expect("snapshot json"),
+        )
+        .expect("validated custom data");
+        assert_eq!(
+            restored
+                .as_any()
+                .downcast_ref::<PolymarketClobMarketInfoSnapshot>(),
+            Some(&snapshot)
+        );
+    }
+
+    #[rstest]
+    fn clob_market_info_snapshot_rejects_identity_and_fee_shape_corruption() {
+        let invalid = serde_json::json!({
+            "markets": [{
+                "condition_id":"0xcondition",
+                "tokens":[{"token_id":"11","outcome":"Yes"},{"token_id":"11","outcome":"No"}],
+                "minimum_order_size":"5",
+                "minimum_tick_size":"0.001",
+                "accepting_orders":true,
+                "neg_risk":true,
+                "fee_rate":"0.0500",
+                "fee_exponent":"1",
+                "taker_only":true,
+                "version":"v1"
+            }],
+            "ts_event":42,
+            "ts_init":42
+        });
+        assert!(PolymarketClobMarketInfoSnapshot::from_json(invalid).is_err());
     }
 
     #[rstest]
