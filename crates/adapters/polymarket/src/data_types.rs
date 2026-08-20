@@ -1099,7 +1099,7 @@ pub struct PolymarketClobMarketInfo {
     tokens: Vec<PolymarketClobTokenDefinition>,
     minimum_order_size: String,
     minimum_tick_size: String,
-    accepting_orders: bool,
+    accepting_orders: Option<bool>,
     neg_risk: bool,
     fee_rate: String,
     fee_exponent: String,
@@ -1159,7 +1159,7 @@ impl PolymarketClobMarketInfo {
     }
 
     #[must_use]
-    pub const fn accepting_orders(&self) -> bool {
+    pub const fn accepting_orders(&self) -> Option<bool> {
         self.accepting_orders
     }
 
@@ -1700,7 +1700,7 @@ mod tests {
         assert_eq!(market.fee_rate(), "0.05");
         assert_eq!(market.fee_exponent(), "1");
         assert!(market.taker_only());
-        assert!(market.accepting_orders());
+        assert_eq!(market.accepting_orders(), Some(true));
         assert!(market.neg_risk());
         assert_eq!(market.version(), "v1");
         assert_eq!(market.tokens()[0].outcome(), "Yes");
@@ -1716,6 +1716,27 @@ mod tests {
                 .downcast_ref::<PolymarketClobMarketInfoSnapshot>(),
             Some(&snapshot)
         );
+    }
+
+    #[rstest]
+    fn clob_market_info_retains_missing_accepting_orders_as_unknown() {
+        let response: ClobMarketInfoResponse = serde_json::from_str(
+            r#"{
+                "c":"0xcondition",
+                "t":[{"t":"11","o":"Yes"},{"t":"22","o":"No"}],
+                "mos":5,
+                "mts":0.001,
+                "nr":true,
+                "fd":{"r":0.05,"e":1,"to":true},
+                "v":"v1"
+            }"#,
+        )
+        .expect("live-compatible CLOB V2 market info without ao");
+        let snapshot =
+            PolymarketClobMarketInfoSnapshot::try_new(vec![response], UnixNanos::from(42_u64))
+                .expect("canonical market info snapshot");
+
+        assert_eq!(snapshot.markets()[0].accepting_orders(), None);
     }
 
     #[rstest]

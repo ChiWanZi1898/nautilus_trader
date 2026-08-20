@@ -479,7 +479,7 @@ pub struct ClobMarketInfoResponse {
     #[serde(rename = "mts")]
     pub minimum_tick_size: GammaDecimal,
     #[serde(rename = "ao")]
-    pub accepting_orders: bool,
+    pub accepting_orders: Option<bool>,
     #[serde(rename = "nr")]
     pub neg_risk: bool,
     #[serde(rename = "fd")]
