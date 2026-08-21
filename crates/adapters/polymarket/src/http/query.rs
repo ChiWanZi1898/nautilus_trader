@@ -15,6 +15,8 @@
 
 //! HTTP query and response model types for the Polymarket CLOB API.
 
+use std::collections::BTreeMap;
+
 use ahash::{AHashMap, AHashSet};
 use derive_builder::Builder;
 use rust_decimal::Decimal;
@@ -99,6 +101,26 @@ pub struct BalanceAllowance {
     pub balance: Decimal,
     #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
     pub allowance: Option<Decimal>,
+    #[serde(default, deserialize_with = "deserialize_decimal_string_map")]
+    pub allowances: BTreeMap<String, Decimal>,
+}
+
+fn deserialize_decimal_string_map<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|(key, value)| {
+            value
+                .parse::<Decimal>()
+                .map(|decimal| (key, decimal))
+                .map_err(serde::de::Error::custom)
+        })
+        .collect()
 }
 
 /// Order submission response from `POST /order` and `POST /orders`.
@@ -592,6 +614,20 @@ mod tests {
 
         assert_eq!(ba.balance, dec!(1_000_000_000));
         assert_eq!(ba.allowance, Some(dec!(999_999_999_000_000)));
+        assert!(ba.allowances.is_empty());
+    }
+
+    #[rstest]
+    fn test_balance_allowance_with_allowances_map() {
+        let ba: BalanceAllowance = serde_json::from_str(
+            r#"{"balance":"1000000000","allowances":{"0xaaa":"999999999000000","0xbbb":"42"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(ba.balance, dec!(1_000_000_000));
+        assert!(ba.allowance.is_none());
+        assert_eq!(ba.allowances["0xaaa"], dec!(999_999_999_000_000));
+        assert_eq!(ba.allowances["0xbbb"], dec!(42));
     }
 
     #[rstest]
@@ -600,6 +636,7 @@ mod tests {
 
         assert_eq!(ba.balance, dec!(250.500000));
         assert!(ba.allowance.is_none());
+        assert!(ba.allowances.is_empty());
     }
 
     #[rstest]
