@@ -19,6 +19,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
 
 use nautilus_network::{
     RECONNECTED,
@@ -38,8 +39,12 @@ use super::{
 };
 use crate::{
     common::credential::Credential, evidence::PolymarketEvidenceBridge,
-    evidence_v2::PolymarketAuthenticatedUserFrameV2,
+    evidence_v2::PolymarketAuthenticatedUserFrameV2, execution::latency::record_user_frame_latency,
 };
+
+fn elapsed_ns(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Commands sent from the outer client to the inner message handler.
 #[derive(Debug)]
@@ -431,6 +436,7 @@ impl FeedHandler {
                     self.last_transport_epoch = transport_epoch;
                     match raw {
                         Message::Text(text) => {
+                            let received_at = Instant::now();
                             if text == RECONNECTED {
                                 self.connection_unavailable_reported = false;
                                 if self.channel == WsChannel::User {
@@ -493,6 +499,7 @@ impl FeedHandler {
                                         return None;
                                     }
                                 };
+                                let projection_ns = elapsed_ns(received_at);
                                 let Some(expected_evidence_sequence) = self
                                     .user_evidence_sequence
                                     .load(Ordering::SeqCst)
@@ -501,6 +508,7 @@ impl FeedHandler {
                                     self.fail_user_evidence("evidence sequence overflow").await;
                                     return None;
                                 };
+                                let evidence_started_at = Instant::now();
                                 match bridge.append_authenticated_user_frame(&fact).await {
                                     Ok(ack)
                                         if ack.fact_id() == fact.fact_id()
@@ -515,6 +523,7 @@ impl FeedHandler {
                                         return None;
                                     }
                                 }
+                                let evidence_ns = elapsed_ns(evidence_started_at);
                                 let Some(next_sequence) = self.user_frame_sequence.checked_add(1)
                                 else {
                                     self.fail_user_evidence("frame sequence overflow").await;
@@ -523,6 +532,11 @@ impl FeedHandler {
                                 self.user_evidence_sequence
                                     .store(expected_evidence_sequence, Ordering::SeqCst);
                                 self.user_frame_sequence = next_sequence;
+                                record_user_frame_latency(
+                                    projection_ns,
+                                    evidence_ns,
+                                    elapsed_ns(received_at),
+                                );
                                 messages
                                     .into_iter()
                                     .map(PolymarketWsMessage::User)

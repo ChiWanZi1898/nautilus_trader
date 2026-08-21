@@ -1,4 +1,4 @@
-//! Lock-free latency counters for the Polymarket LIMIT submit hot path.
+//! Lock-free latency counters for Polymarket execution hot paths.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,6 +17,14 @@ pub struct PolymarketSubmitLatencySnapshot {
     pub encode_request: PolymarketSubmitLatencyStage,
     pub pre_http: PolymarketSubmitLatencyStage,
     pub http_round_trip: PolymarketSubmitLatencyStage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PolymarketUserFrameLatencySnapshot {
+    pub samples: u64,
+    pub projection: PolymarketSubmitLatencyStage,
+    pub evidence: PolymarketSubmitLatencyStage,
+    pub total: PolymarketSubmitLatencyStage,
 }
 
 #[derive(Default)]
@@ -87,6 +95,33 @@ static COUNTERS: SubmitLatencyCounters = SubmitLatencyCounters {
     },
 };
 
+#[derive(Default)]
+struct UserFrameLatencyCounters {
+    samples: AtomicU64,
+    projection: StageCounters,
+    evidence: StageCounters,
+    total: StageCounters,
+}
+
+static USER_FRAME_COUNTERS: UserFrameLatencyCounters = UserFrameLatencyCounters {
+    samples: AtomicU64::new(0),
+    projection: StageCounters {
+        last_ns: AtomicU64::new(0),
+        max_ns: AtomicU64::new(0),
+        sum_ns: AtomicU64::new(0),
+    },
+    evidence: StageCounters {
+        last_ns: AtomicU64::new(0),
+        max_ns: AtomicU64::new(0),
+        sum_ns: AtomicU64::new(0),
+    },
+    total: StageCounters {
+        last_ns: AtomicU64::new(0),
+        max_ns: AtomicU64::new(0),
+        sum_ns: AtomicU64::new(0),
+    },
+};
+
 #[must_use]
 pub fn polymarket_submit_latency_snapshot() -> PolymarketSubmitLatencySnapshot {
     PolymarketSubmitLatencySnapshot {
@@ -108,6 +143,23 @@ pub fn reset_polymarket_submit_latency() {
     COUNTERS.http_round_trip.reset();
 }
 
+#[must_use]
+pub fn polymarket_user_frame_latency_snapshot() -> PolymarketUserFrameLatencySnapshot {
+    PolymarketUserFrameLatencySnapshot {
+        samples: USER_FRAME_COUNTERS.samples.load(Ordering::Relaxed),
+        projection: USER_FRAME_COUNTERS.projection.snapshot(),
+        evidence: USER_FRAME_COUNTERS.evidence.snapshot(),
+        total: USER_FRAME_COUNTERS.total.snapshot(),
+    }
+}
+
+pub fn reset_polymarket_user_frame_latency() {
+    USER_FRAME_COUNTERS.samples.store(0, Ordering::Relaxed);
+    USER_FRAME_COUNTERS.projection.reset();
+    USER_FRAME_COUNTERS.evidence.reset();
+    USER_FRAME_COUNTERS.total.reset();
+}
+
 pub(crate) fn record_limit_submit_latency(
     task_queue_ns: u64,
     prepare_and_sign_ns: u64,
@@ -121,6 +173,13 @@ pub(crate) fn record_limit_submit_latency(
     COUNTERS.pre_http.record(pre_http_ns);
     COUNTERS.http_round_trip.record(http_round_trip_ns);
     COUNTERS.samples.fetch_add(1, Ordering::Release);
+}
+
+pub(crate) fn record_user_frame_latency(projection_ns: u64, evidence_ns: u64, total_ns: u64) {
+    USER_FRAME_COUNTERS.projection.record(projection_ns);
+    USER_FRAME_COUNTERS.evidence.record(evidence_ns);
+    USER_FRAME_COUNTERS.total.record(total_ns);
+    USER_FRAME_COUNTERS.samples.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -142,5 +201,22 @@ mod tests {
 
         reset_polymarket_submit_latency();
         assert_eq!(polymarket_submit_latency_snapshot(), Default::default());
+    }
+
+    #[test]
+    fn records_and_resets_user_frame_metrics() {
+        reset_polymarket_user_frame_latency();
+        record_user_frame_latency(11, 22, 33);
+        record_user_frame_latency(12, 24, 36);
+
+        let snapshot = polymarket_user_frame_latency_snapshot();
+        assert_eq!(snapshot.samples, 2);
+        assert_eq!(snapshot.projection.last_ns, 12);
+        assert_eq!(snapshot.projection.sum_ns, 23);
+        assert_eq!(snapshot.evidence.max_ns, 24);
+        assert_eq!(snapshot.total.sum_ns, 69);
+
+        reset_polymarket_user_frame_latency();
+        assert_eq!(polymarket_user_frame_latency_snapshot(), Default::default());
     }
 }
