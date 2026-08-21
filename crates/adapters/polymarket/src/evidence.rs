@@ -539,6 +539,12 @@ pub trait PolymarketEvidenceBridge: Debug + Send + Sync {
         inbound_high_watermark: u64,
     ) -> Result<(), PolymarketEvidenceError>;
 
+    /// Irreversibly revokes the current process health after authenticated stream continuity is
+    /// lost. A fresh process must recover and reconcile before submission can resume.
+    fn revoke_health(&self) -> Result<(), PolymarketEvidenceError> {
+        Err(PolymarketEvidenceError::Unavailable)
+    }
+
     /// Appends one immutable mutation fact and returns only after durability.
     async fn append_mutation(
         &self,

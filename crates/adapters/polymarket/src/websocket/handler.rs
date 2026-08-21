@@ -147,6 +147,14 @@ impl FeedHandler {
         self.signal.store(true, Ordering::SeqCst);
     }
 
+    fn revoke_user_evidence_health(&self) {
+        if self.channel == WsChannel::User
+            && let Some(bridge) = &self.evidence_bridge
+        {
+            let _ = bridge.revoke_health();
+        }
+    }
+
     async fn send_subscribe_market(&mut self, asset_ids: &[String]) {
         let Some(ref client) = self.client else {
             log::warn!("No client available for market subscribe");
@@ -331,14 +339,14 @@ impl FeedHandler {
     }
 
     pub(super) async fn next(&mut self) -> Option<PolymarketConnectionMessage> {
-        if self.channel == WsChannel::Market
-            && !self.connection_unavailable_reported
+        if !self.connection_unavailable_reported
             && self
                 .client
                 .as_ref()
                 .is_some_and(WebSocketClient::is_reconnecting)
         {
             self.connection_unavailable_reported = true;
+            self.revoke_user_evidence_health();
             return Some(PolymarketConnectionMessage {
                 transport_epoch: self.last_transport_epoch,
                 message: PolymarketWsMessage::ConnectionUnavailable,
@@ -349,25 +357,26 @@ impl FeedHandler {
         }
 
         loop {
-            if self.channel == WsChannel::Market
-                && !self.connection_unavailable_reported
+            if !self.connection_unavailable_reported
                 && self
                     .client
                     .as_ref()
                     .is_some_and(WebSocketClient::is_reconnecting)
             {
                 self.connection_unavailable_reported = true;
+                self.revoke_user_evidence_health();
                 return Some(PolymarketConnectionMessage {
                     transport_epoch: self.last_transport_epoch,
                     message: PolymarketWsMessage::ConnectionUnavailable,
                 });
             }
             tokio::select! {
-                () = tokio::time::sleep(tokio::time::Duration::from_millis(5)), if self.channel == WsChannel::Market => {
+                () = tokio::time::sleep(tokio::time::Duration::from_millis(5)) => {
                     if !self.connection_unavailable_reported
                         && self.client.as_ref().is_some_and(WebSocketClient::is_reconnecting)
                     {
                         self.connection_unavailable_reported = true;
+                        self.revoke_user_evidence_health();
                         return Some(PolymarketConnectionMessage {
                             transport_epoch: self.last_transport_epoch,
                             message: PolymarketWsMessage::ConnectionUnavailable,
@@ -408,6 +417,17 @@ impl FeedHandler {
                     }
                 }
                 Some((transport_epoch, raw)) = self.raw_rx.recv() => {
+                    if self.channel == WsChannel::User
+                        && transport_epoch != self.last_transport_epoch
+                    {
+                        self.last_transport_epoch = transport_epoch;
+                        self.connection_unavailable_reported = true;
+                        self.revoke_user_evidence_health();
+                        return Some(PolymarketConnectionMessage {
+                            transport_epoch,
+                            message: PolymarketWsMessage::ConnectionUnavailable,
+                        });
+                    }
                     self.last_transport_epoch = transport_epoch;
                     match raw {
                         Message::Text(text) => {
@@ -572,6 +592,7 @@ mod tests {
         mismatch_ack: AtomicBool,
         mismatch_sequence: AtomicBool,
         evidence_sequence: AtomicU64,
+        revoked: AtomicBool,
     }
 
     #[async_trait]
@@ -590,6 +611,11 @@ mod tests {
             } else {
                 Err(PolymarketEvidenceError::InvalidAcknowledgement)
             }
+        }
+
+        fn revoke_health(&self) -> Result<(), PolymarketEvidenceError> {
+            self.revoked.store(true, Ordering::SeqCst);
+            Ok(())
         }
 
         async fn append_mutation(
@@ -753,6 +779,32 @@ mod tests {
             })
         ));
         assert_eq!(bridge.frames.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn user_transport_epoch_change_precedes_new_epoch_application_data() {
+        let bridge = Arc::new(TestFrameBridge::default());
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
+        raw_tx
+            .send((
+                1,
+                Message::Text(
+                    include_str!("../../test_data/ws_user_batch_msg.json")
+                        .to_string()
+                        .into(),
+                ),
+            ))
+            .expect("send new-epoch user frame");
+
+        let message = handler.next().await.expect("connection unavailable marker");
+        assert_eq!(message.transport_epoch, 1);
+        assert!(matches!(
+            message.message,
+            PolymarketWsMessage::ConnectionUnavailable
+        ));
+        assert!(handler.message_buffer.is_empty());
+        assert!(bridge.frames.lock().await.is_empty());
+        assert!(bridge.revoked.load(Ordering::SeqCst));
     }
 
     #[rstest]
