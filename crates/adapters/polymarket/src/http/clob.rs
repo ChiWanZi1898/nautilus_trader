@@ -248,7 +248,7 @@ impl PolymarketClobHttpClient {
             .map_err(Error::from_http_client)?;
 
         if response.status.is_success() {
-            if response.body.is_empty() || response.body.as_ref() == b"null" {
+            if is_empty_or_null_json(&response.body) {
                 Ok(None)
             } else {
                 serde_json::from_slice(&response.body)
@@ -644,6 +644,18 @@ impl PolymarketClobHttpClient {
     }
 }
 
+fn is_empty_or_null_json(body: &[u8]) -> bool {
+    let Some(start) = body.iter().position(|byte| !byte.is_ascii_whitespace()) else {
+        return true;
+    };
+    let end = body
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .expect("a non-whitespace byte exists")
+        + 1;
+    &body[start..end] == b"null"
+}
+
 /// Provides an unauthenticated HTTP client for public CLOB endpoints.
 ///
 /// Unlike [`PolymarketClobHttpClient`], this client does not require credentials
@@ -823,6 +835,15 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn optional_json_accepts_whitespace_around_null() {
+        assert!(is_empty_or_null_json(b""));
+        assert!(is_empty_or_null_json(b" \r\n\t"));
+        assert!(is_empty_or_null_json(b"\nnull\r\n"));
+        assert!(!is_empty_or_null_json(b"{}"));
+        assert!(!is_empty_or_null_json(b"nullx"));
+    }
     use crate::http::models::{ClobBookLevel, ClobBookResponse};
 
     fn build_book_from_response(resp: &ClobBookResponse) -> OrderBook {
