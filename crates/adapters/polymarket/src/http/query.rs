@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 
 use ahash::{AHashMap, AHashSet};
+use alloy_primitives::U256;
 use derive_builder::Builder;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -102,12 +103,12 @@ pub struct BalanceAllowance {
     #[serde(default, deserialize_with = "deserialize_optional_decimal_from_str")]
     pub allowance: Option<Decimal>,
     #[serde(default, deserialize_with = "deserialize_decimal_string_map")]
-    pub allowances: BTreeMap<String, Decimal>,
+    pub allowances: BTreeMap<String, U256>,
 }
 
 fn deserialize_decimal_string_map<'de, D>(
     deserializer: D,
-) -> Result<BTreeMap<String, Decimal>, D::Error>
+) -> Result<BTreeMap<String, U256>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -116,8 +117,8 @@ where
         .into_iter()
         .map(|(key, value)| {
             value
-                .parse::<Decimal>()
-                .map(|decimal| (key, decimal))
+                .parse::<U256>()
+                .map(|integer| (key, integer))
                 .map_err(serde::de::Error::custom)
         })
         .collect()
@@ -620,14 +621,19 @@ mod tests {
     #[rstest]
     fn test_balance_allowance_with_allowances_map() {
         let ba: BalanceAllowance = serde_json::from_str(
-            r#"{"balance":"1000000000","allowances":{"0xaaa":"999999999000000","0xbbb":"42"}}"#,
+            r#"{"balance":"1000000000","allowances":{"0xaaa":"115792089237316195423570985008687907853269984665640564039457584007913072382353","0xbbb":"42"}}"#,
         )
         .unwrap();
 
         assert_eq!(ba.balance, dec!(1_000_000_000));
         assert!(ba.allowance.is_none());
-        assert_eq!(ba.allowances["0xaaa"], dec!(999_999_999_000_000));
-        assert_eq!(ba.allowances["0xbbb"], dec!(42));
+        assert_eq!(
+            ba.allowances["0xaaa"],
+            "115792089237316195423570985008687907853269984665640564039457584007913072382353"
+                .parse::<U256>()
+                .unwrap()
+        );
+        assert_eq!(ba.allowances["0xbbb"], U256::from(42));
     }
 
     #[rstest]
