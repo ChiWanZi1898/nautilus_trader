@@ -530,6 +530,21 @@ fn handle_market_message_from_source(
                     "Dropping book snapshot for {instrument_id}: stale shard/generation source"
                 );
             } else if active_delta {
+                let snapshot_ts_event = parse_timestamp_ms(&snap.timestamp);
+                let same_source_ready = ctx
+                    .ready_book_sources
+                    .get(&instrument_id)
+                    .is_some_and(|ready| *ready == source);
+                if same_source_ready
+                    && snapshot_ts_event.is_ok_and(|snapshot_ts_event| {
+                        ctx.order_books
+                            .get(&instrument_id)
+                            .is_some_and(|book| snapshot_ts_event < book.ts_last)
+                    })
+                {
+                    log::debug!("Dropping older same-source book snapshot for {instrument_id}");
+                    return;
+                }
                 match parse_book_snapshot(
                     &snap,
                     instrument_id,
@@ -3954,6 +3969,15 @@ mod tests {
     }
 
     fn make_snapshot(market: &str, asset_id: &str, prices: &[(&str, &str)]) -> MarketWsMessage {
+        make_snapshot_at(market, asset_id, prices, "1700000000000")
+    }
+
+    fn make_snapshot_at(
+        market: &str,
+        asset_id: &str,
+        prices: &[(&str, &str)],
+        timestamp: &str,
+    ) -> MarketWsMessage {
         let mid = prices.len() / 2;
         let bids = prices[..mid].iter().map(|(p, s)| level(p, s)).collect();
         let asks = prices[mid..].iter().map(|(p, s)| level(p, s)).collect();
@@ -3962,7 +3986,7 @@ mod tests {
             asset_id: Ustr::from(asset_id),
             bids,
             asks,
-            timestamp: "1700000000000".to_string(),
+            timestamp: timestamp.to_string(),
             hash: None,
         })
     }
@@ -4338,6 +4362,110 @@ mod tests {
         let commit = frame_commit(&events[2]).expect("frame commit after snapshot readiness");
         assert_eq!(commit.frame_id(), 1);
         assert_eq!(commit.affected_instrument_ids(), &[instrument_id]);
+    }
+
+    #[rstest]
+    fn older_same_source_snapshot_cannot_replace_a_ready_book() {
+        let asset_id = "0xTOKEN-STALE-SNAPSHOT";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot_at(
+                "0xMARKET",
+                asset_id,
+                &[("0.49", "10"), ("0.51", "10")],
+                "1700000001000",
+            ),
+            &ctx,
+        );
+        handle_market_message(make_price_change("0xMARKET", asset_id, "0.50", "9"), &ctx);
+        while data_rx.try_recv().is_ok() {}
+        let frame_before = ctx.frame_counter.load(Ordering::Relaxed);
+
+        handle_market_message(
+            make_snapshot_at(
+                "0xMARKET",
+                asset_id,
+                &[("0.40", "10"), ("0.60", "10")],
+                "1700000000000",
+            ),
+            &ctx,
+        );
+
+        assert_eq!(ctx.frame_counter.load(Ordering::Relaxed), frame_before);
+        assert!(data_rx.try_recv().is_err());
+        assert_eq!(
+            ctx.order_books
+                .get(&instrument_id)
+                .and_then(|book| book.best_bid_price()),
+            Some(Price::from("0.50"))
+        );
+    }
+
+    #[rstest]
+    fn new_connection_epoch_accepts_an_older_venue_snapshot_as_its_baseline() {
+        let asset_id = "0xTOKEN-NEW-EPOCH-SNAPSHOT";
+        let token = Ustr::from(asset_id);
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::Message {
+                shard_id: 7,
+                connection_generation: 1,
+                message: PolymarketWsMessage::Market(make_snapshot_at(
+                    "0xMARKET",
+                    asset_id,
+                    &[("0.49", "10"), ("0.51", "10")],
+                    "1700000002000",
+                )),
+            },
+            &ctx,
+        );
+        while data_rx.try_recv().is_ok() {}
+
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::ConnectionEpochAdvanced {
+                shard_id: 7,
+                connection_generation: 2,
+                assigned_asset_ids: vec![token],
+            },
+            &ctx,
+        );
+        handle_market_pool_event(
+            PolymarketMarketPoolEvent::Message {
+                shard_id: 7,
+                connection_generation: 2,
+                message: PolymarketWsMessage::Market(make_snapshot_at(
+                    "0xMARKET",
+                    asset_id,
+                    &[("0.40", "10"), ("0.60", "10")],
+                    "1700000001000",
+                )),
+            },
+            &ctx,
+        );
+
+        assert_eq!(
+            ctx.ready_book_sources
+                .get(&instrument_id)
+                .map(|source| *source),
+            Some(BookSource {
+                shard_id: 7,
+                connection_generation: 2,
+            })
+        );
+        assert_eq!(
+            ctx.order_books
+                .get(&instrument_id)
+                .and_then(|book| book.best_bid_price()),
+            Some(Price::from("0.40"))
+        );
     }
 
     #[rstest]
