@@ -719,6 +719,17 @@ fn handle_market_message_from_source(
                         "Ignoring pre-snapshot price changes for {instrument_id} until its baseline snapshot arrives",
                     );
                 }
+                if active
+                    && ready
+                    && ctx
+                        .order_books
+                        .get(&instrument_id)
+                        .is_some_and(|book| ts_event < book.ts_last)
+                {
+                    frame_valid = false;
+                    log::debug!("Rejecting timestamp-regressing price changes for {instrument_id}");
+                    continue;
+                }
 
                 let mut parsed = Vec::with_capacity(changes.len());
                 for change in changes {
@@ -4002,6 +4013,16 @@ mod tests {
     }
 
     fn make_price_change(market: &str, asset_id: &str, price: &str, size: &str) -> MarketWsMessage {
+        make_price_change_at(market, asset_id, price, size, "1700000002000")
+    }
+
+    fn make_price_change_at(
+        market: &str,
+        asset_id: &str,
+        price: &str,
+        size: &str,
+        timestamp: &str,
+    ) -> MarketWsMessage {
         MarketWsMessage::PriceChange(PolymarketQuotes {
             market: Ustr::from(market),
             price_changes: vec![PolymarketQuote {
@@ -4013,7 +4034,7 @@ mod tests {
                 best_bid: None,
                 best_ask: None,
             }],
-            timestamp: "1700000002000".to_string(),
+            timestamp: timestamp.to_string(),
         })
     }
 
@@ -4403,6 +4424,55 @@ mod tests {
                 .and_then(|book| book.best_bid_price()),
             Some(Price::from("0.50"))
         );
+    }
+
+    #[rstest]
+    fn timestamp_regression_invalidates_ready_book_without_emitting_stale_deltas() {
+        let asset_id = "0xTOKEN-STALE-DELTA";
+        let (ctx, mut data_rx) = make_ws_ctx();
+        let instrument_id =
+            seed_instrument(&ctx, asset_id, Price::from("0.01"), Quantity::from("0.01")).id();
+        ctx.active_delta_subs.insert(instrument_id);
+
+        handle_market_message(
+            make_snapshot_at(
+                "0xMARKET",
+                asset_id,
+                &[("0.49", "10"), ("0.51", "10")],
+                "1700000002000",
+            ),
+            &ctx,
+        );
+        while data_rx.try_recv().is_ok() {}
+        let frame_before = ctx.frame_counter.load(Ordering::Relaxed);
+
+        handle_market_message(
+            make_price_change_at("0xMARKET", asset_id, "0.50", "9", "1700000001000"),
+            &ctx,
+        );
+
+        assert_eq!(ctx.frame_counter.load(Ordering::Relaxed), frame_before);
+        assert!(!ctx.order_books.contains_key(&instrument_id));
+        assert!(!ctx.ready_book_sources.contains_key(&instrument_id));
+        assert!(
+            ctx.pending_snapshot_after_tick_change
+                .contains(&instrument_id)
+        );
+        let events: Vec<DataEvent> = std::iter::from_fn(|| data_rx.try_recv().ok()).collect();
+        assert_eq!(events.iter().filter_map(book_readiness).count(), 1);
+        let readiness = events.iter().find_map(book_readiness).unwrap();
+        assert_eq!(
+            readiness.state(),
+            PolymarketBookReadinessState::AwaitingSnapshot
+        );
+        assert_eq!(
+            readiness.reason(),
+            PolymarketBookReadinessReason::MalformedFrame
+        );
+        assert!(events.iter().all(|event| {
+            !matches!(event, DataEvent::Data(NautilusData::Deltas(_)))
+                && frame_commit(event).is_none()
+        }));
     }
 
     #[rstest]
