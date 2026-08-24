@@ -146,6 +146,9 @@ impl FeedHandler {
     async fn fail_user_evidence(&self, reason: &str) {
         log::error!("Authenticated user evidence lane failed: {reason}");
         self.auth_tracker.fail(reason.to_owned());
+        // Revoke the shared submission gate before awaiting transport teardown. A disconnect can
+        // stall, but an open maker must become ineligible on the next Strategy scheduler tick.
+        self.revoke_user_evidence_health();
         if let Some(client) = &self.client {
             client.disconnect().await;
         }
@@ -486,7 +489,10 @@ impl FeedHandler {
                                     &api_key,
                                 ) {
                                     Ok(fact) => fact,
-                                    Err(_) => {
+                                    Err(error) => {
+                                        log::error!(
+                                            "Authenticated user frame projection category: {error}"
+                                        );
                                         self.fail_user_evidence("strict V2 projection failed").await;
                                         return None;
                                     }
@@ -856,7 +862,7 @@ mod tests {
     async fn durability_failure_releases_no_authenticated_element() {
         let bridge = Arc::new(TestFrameBridge::default());
         bridge.fail.store(true, Ordering::SeqCst);
-        let (mut handler, raw_tx) = user_handler_with_bridge(bridge);
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
         raw_tx
             .send((
                 0,
@@ -871,6 +877,29 @@ mod tests {
         assert!(handler.next().await.is_none());
         assert!(handler.is_stopped());
         assert!(handler.message_buffer.is_empty());
+        assert!(bridge.revoked.load(Ordering::SeqCst));
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn projection_failure_revokes_shared_health_before_returning() {
+        let bridge = Arc::new(TestFrameBridge::default());
+        let (mut handler, raw_tx) = user_handler_with_bridge(bridge.clone());
+        raw_tx
+            .send((
+                0,
+                Message::Text(
+                    r#"{"event_type":"trade","unknown":"strict-v2-rejects"}"#
+                        .to_owned()
+                        .into(),
+                ),
+            ))
+            .expect("send invalid raw frame");
+
+        assert!(handler.next().await.is_none());
+        assert!(handler.is_stopped());
+        assert!(handler.message_buffer.is_empty());
+        assert!(bridge.revoked.load(Ordering::SeqCst));
     }
 
     #[rstest]

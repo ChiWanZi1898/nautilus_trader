@@ -942,6 +942,7 @@ struct WireTrade {
     maker_address: String,
     maker_orders: BoundedVec<WireMaker, MAX_NESTED>,
     market: String,
+    #[serde(alias = "matchtime")]
     match_time: String,
     outcome: String,
     owner: String,
@@ -1892,6 +1893,36 @@ mod tests {
         )
         .unwrap();
         assert_ne!(single.fact_id(), batch.fact_id());
+    }
+
+    #[test]
+    fn current_user_channel_matchtime_alias_has_the_same_canonical_identity() {
+        let raw = fixture("ws_user_trade_msg.json");
+        let legacy =
+            PolymarketAuthenticatedUserFrameV2::project(&raw, 2, 1, ACCOUNT, API_KEY).unwrap();
+
+        let mut current: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let match_time = current
+            .as_object_mut()
+            .unwrap()
+            .remove("match_time")
+            .unwrap();
+        current["matchtime"] = match_time;
+        let current = PolymarketAuthenticatedUserFrameV2::project(
+            &serde_json::to_string(&current).unwrap(),
+            2,
+            1,
+            ACCOUNT,
+            API_KEY,
+        )
+        .unwrap();
+
+        assert_eq!(current.fact_id(), legacy.fact_id());
+        assert_eq!(current.canonical_bytes(), legacy.canonical_bytes());
+        assert_eq!(
+            current.to_dispatch_messages(),
+            legacy.to_dispatch_messages()
+        );
     }
 
     #[test]
