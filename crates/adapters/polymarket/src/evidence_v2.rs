@@ -900,10 +900,22 @@ impl WireOrder {
         account_address: &str,
         api_key: &str,
     ) -> Result<PolymarketUserEvidenceElementV2, PolymarketEvidenceV2Error> {
+        let owner_matches_api_key = self.owner == api_key;
+        let maker_address_matches_account = self
+            .maker_address
+            .as_deref()
+            .map_or(owner_matches_api_key, |maker| maker == account_address);
         let maker_address = self
             .maker_address
             .unwrap_or_else(|| ABSENT_WIRE_TEXT.to_string());
-        let order_owner_matches_api_key = self.order_owner.as_deref() == Some(api_key);
+        // Current user-channel payloads may omit the redundant `order_owner`
+        // relation.  The mandatory authenticated `owner` remains the source of
+        // identity in that case; a present contradictory value is still kept as
+        // a mismatch so the reducer fails closed.
+        let order_owner_matches_api_key = self
+            .order_owner
+            .as_deref()
+            .map_or(owner_matches_api_key, |owner| owner == api_key);
         let order_type = self
             .order_type
             .ok_or(PolymarketEvidenceV2Error::InvalidField)?;
@@ -948,8 +960,8 @@ impl WireOrder {
                 maker_address: maker_address.clone(),
                 market: self.market,
                 ownership: PolymarketOrderOwnershipV2 {
-                    maker_address_matches_account: maker_address == account_address,
-                    owner_matches_api_key: self.owner == api_key,
+                    maker_address_matches_account,
+                    owner_matches_api_key,
                     order_owner_matches_api_key,
                 },
                 order_type: parse_order_type(&order_type)?,
@@ -1031,7 +1043,14 @@ impl WireTrade {
         let trader_side = self
             .trader_side
             .ok_or(PolymarketEvidenceV2Error::InvalidField)?;
-        let trade_owner_matches_api_key = self.trade_owner.as_deref() == Some(api_key);
+        let owner_matches_api_key = self.owner == api_key;
+        // `trade_owner` is nullable in the current wire schema.  When absent,
+        // inherit the mandatory authenticated `owner` relation.  A present
+        // foreign value remains a mismatch and is rejected by reduction.
+        let trade_owner_matches_api_key = self
+            .trade_owner
+            .as_deref()
+            .map_or(owner_matches_api_key, |owner| owner == api_key);
         validate_many([
             self.asset_id.as_str(),
             self.id.as_str(),
@@ -1074,7 +1093,7 @@ impl WireTrade {
                 outcome,
                 ownership: PolymarketTradeOwnershipV2 {
                     maker_address_matches_account: maker_address == account_address,
-                    owner_matches_api_key: self.owner == api_key,
+                    owner_matches_api_key,
                     trade_owner_matches_api_key,
                 },
                 price: PolymarketWireDecimalV2::parse(&self.price)?,
@@ -1117,6 +1136,11 @@ impl WireMaker {
         account_address: &str,
         api_key: &str,
     ) -> Result<PolymarketMakerEvidenceV2, PolymarketEvidenceV2Error> {
+        let owner_matches_api_key = self.owner == api_key;
+        let maker_address_matches_account = self
+            .maker_address
+            .as_deref()
+            .map_or(owner_matches_api_key, |maker| maker == account_address);
         let maker_address = self
             .maker_address
             .unwrap_or_else(|| ABSENT_WIRE_TEXT.to_string());
@@ -1134,8 +1158,8 @@ impl WireMaker {
             order_id: self.order_id,
             outcome,
             ownership: PolymarketMakerOwnershipV2 {
-                maker_address_matches_account: maker_address == account_address,
-                owner_matches_api_key: self.owner == api_key,
+                maker_address_matches_account,
+                owner_matches_api_key,
             },
             price: PolymarketWireDecimalV2::parse(&self.price)?,
             side: self.side.as_deref().map(parse_side).transpose()?,
@@ -1997,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn current_nullable_trade_fields_project_without_minting_ownership() {
+    fn current_nullable_trade_fields_use_authenticated_owner_as_corroboration() {
         let mut value: serde_json::Value =
             serde_json::from_str(&fixture("ws_user_trade.json")).unwrap();
         value["event_type"] = serde_json::json!("trade");
@@ -2007,6 +2031,7 @@ mod tests {
         value["bucket_index"] = serde_json::Value::Null;
         value["outcome"] = serde_json::Value::Null;
         value["maker_orders"][0]["maker_address"] = serde_json::Value::Null;
+        value["maker_orders"][0]["owner"] = serde_json::json!(API_KEY);
         value["maker_orders"][0]["outcome"] = serde_json::Value::Null;
         value["maker_orders"][0]["outcome_index"] = serde_json::json!(1);
 
@@ -2022,13 +2047,44 @@ mod tests {
             panic!("expected trade");
         };
         assert!(!trade.ownership().maker_address_matches_account());
+        assert!(trade.ownership().owner_matches_api_key());
+        assert!(trade.ownership().trade_owner_matches_api_key());
+        assert!(
+            trade.maker_rows()[0]
+                .ownership()
+                .maker_address_matches_account()
+        );
+        assert!(trade.maker_rows()[0].ownership().owner_matches_api_key());
+        assert!(frame.to_dispatch_messages().is_ok());
+    }
+
+    #[test]
+    fn present_foreign_nullable_ownership_relations_remain_mismatches() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fixture("ws_user_trade.json")).unwrap();
+        value["event_type"] = serde_json::json!("trade");
+        value["trade_owner"] = serde_json::json!("foreign-owner");
+        value["maker_orders"][0]["maker_address"] = serde_json::json!("0xforeign");
+
+        let frame = PolymarketAuthenticatedUserFrameV2::project(
+            &serde_json::to_string(&value).unwrap(),
+            2,
+            1,
+            ACCOUNT,
+            API_KEY,
+        )
+        .unwrap();
+        let PolymarketUserEvidenceElementV2::Trade(trade) = &frame.elements()[0] else {
+            panic!("expected trade");
+        };
+        assert!(trade.ownership().owner_matches_api_key());
         assert!(!trade.ownership().trade_owner_matches_api_key());
+        assert!(!trade.maker_rows()[0].ownership().owner_matches_api_key());
         assert!(
             !trade.maker_rows()[0]
                 .ownership()
                 .maker_address_matches_account()
         );
-        assert!(frame.to_dispatch_messages().is_ok());
     }
 
     #[test]
