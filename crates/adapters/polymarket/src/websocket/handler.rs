@@ -38,8 +38,10 @@ use super::{
     },
 };
 use crate::{
-    common::credential::Credential, evidence::PolymarketEvidenceBridge,
-    evidence_v2::PolymarketAuthenticatedUserFrameV2, execution::latency::record_user_frame_latency,
+    common::credential::Credential,
+    evidence::PolymarketEvidenceBridge,
+    evidence_v2::{PolymarketAuthenticatedUserFrameV2, wire_schema_summary},
+    execution::latency::record_user_frame_latency,
 };
 
 fn elapsed_ns(started_at: Instant) -> u64 {
@@ -491,7 +493,8 @@ impl FeedHandler {
                                     Ok(fact) => fact,
                                     Err(error) => {
                                         log::error!(
-                                            "Authenticated user frame projection category: {error}"
+                                            "Authenticated user frame projection category: {error}; {}",
+                                            wire_schema_summary(&text)
                                         );
                                         self.fail_user_evidence("strict V2 projection failed").await;
                                         return None;

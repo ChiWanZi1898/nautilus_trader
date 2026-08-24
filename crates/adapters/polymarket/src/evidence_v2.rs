@@ -43,6 +43,7 @@ use crate::{
 const HASH_DOMAIN: &[u8] = b"nautilus-polymarket/authenticated-user-frame/v2\0";
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENTS: usize = 1024;
+const ABSENT_WIRE_TEXT: &str = "<absent>";
 const MAX_NESTED: usize = 1024;
 const MAX_TEXT: usize = 512;
 const MAX_DECIMAL: usize = 128;
@@ -795,6 +796,33 @@ pub(crate) const fn dispatch_api_key_marker() -> &'static str {
     OWNED_RELATION_MARKER
 }
 
+/// Returns a bounded, value-free description of an unrecognized authenticated wire shape.
+///
+/// This is safe to log because it retains JSON object keys only, never credential-bearing values.
+pub(crate) fn wire_schema_summary(raw: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "non-json".to_string();
+    };
+    let values = value
+        .as_array()
+        .map_or_else(|| vec![&value], |items| items.iter().collect());
+    let mut shapes = Vec::new();
+    for item in values.into_iter().take(8) {
+        let Some(object) = item.as_object() else {
+            shapes.push("non-object".to_string());
+            continue;
+        };
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        shapes.push(keys.join(","));
+    }
+    format!(
+        "elements={} shapes=[{}]",
+        value.as_array().map_or(1, Vec::len),
+        shapes.join(" | ")
+    )
+}
+
 #[derive(Debug, Error, Clone, Copy, Eq, PartialEq)]
 pub enum PolymarketEvidenceV2Error {
     #[error("authenticated user frame is invalid")]
@@ -841,20 +869,26 @@ struct WireOrder {
     asset_id: String,
     #[serde(default)]
     associate_trades: Option<BoundedVec<String, MAX_NESTED>>,
-    created_at: String,
+    #[serde(default)]
+    created_at: Option<String>,
     expiration: Option<String>,
     id: String,
-    maker_address: String,
+    #[serde(default)]
+    maker_address: Option<String>,
     market: String,
-    order_owner: String,
-    order_type: String,
+    #[serde(default)]
+    order_owner: Option<String>,
+    #[serde(default)]
+    order_type: Option<String>,
     original_size: String,
-    outcome: String,
+    #[serde(default)]
+    outcome: Option<String>,
     owner: String,
     price: String,
     side: String,
     size_matched: String,
-    status: String,
+    #[serde(default)]
+    status: Option<String>,
     timestamp: String,
     #[serde(rename = "type")]
     event: String,
@@ -866,6 +900,14 @@ impl WireOrder {
         account_address: &str,
         api_key: &str,
     ) -> Result<PolymarketUserEvidenceElementV2, PolymarketEvidenceV2Error> {
+        let maker_address = self
+            .maker_address
+            .unwrap_or_else(|| ABSENT_WIRE_TEXT.to_string());
+        let order_owner_matches_api_key = self.order_owner.as_deref() == Some(api_key);
+        let order_type = self
+            .order_type
+            .ok_or(PolymarketEvidenceV2Error::InvalidField)?;
+        let status = self.status.ok_or(PolymarketEvidenceV2Error::InvalidField)?;
         let associated = self
             .associate_trades
             .map(BoundedVec::into_vec)
@@ -873,17 +915,16 @@ impl WireOrder {
         validate_many([
             self.asset_id.as_str(),
             self.id.as_str(),
-            self.maker_address.as_str(),
+            maker_address.as_str(),
             self.market.as_str(),
             self.timestamp.as_str(),
             self.owner.as_str(),
-            self.order_owner.as_str(),
         ])?;
         validate_unsigned(&self.timestamp)?;
         for trade in &associated {
             validate_text(trade)?;
         }
-        let created_at = optional_nonempty(self.created_at);
+        let created_at = self.created_at.and_then(optional_nonempty);
         if let Some(value) = created_at.as_deref() {
             validate_unsigned(value)?;
         }
@@ -891,8 +932,8 @@ impl WireOrder {
         if let Some(value) = expiration.as_deref() {
             validate_unsigned(value)?;
         }
-        let outcome = validated_optional(self.outcome)?;
-        let (status, status_detail) = parse_order_status(&self.status)?;
+        let outcome = self.outcome.map(validated_optional).transpose()?.flatten();
+        let (status, status_detail) = parse_order_status(&status)?;
         let event = parse_event(&self.event)?;
         if event == PolymarketEvidenceEventV2::Trade {
             return Err(PolymarketEvidenceV2Error::InvalidField);
@@ -904,14 +945,14 @@ impl WireOrder {
                 created_at,
                 expiration,
                 order_id: self.id,
-                maker_address: self.maker_address.clone(),
+                maker_address: maker_address.clone(),
                 market: self.market,
                 ownership: PolymarketOrderOwnershipV2 {
-                    maker_address_matches_account: self.maker_address == account_address,
+                    maker_address_matches_account: maker_address == account_address,
                     owner_matches_api_key: self.owner == api_key,
-                    order_owner_matches_api_key: self.order_owner == api_key,
+                    order_owner_matches_api_key,
                 },
-                order_type: parse_order_type(&self.order_type)?,
+                order_type: parse_order_type(&order_type)?,
                 original_size: PolymarketWireDecimalV2::parse(&self.original_size)?,
                 outcome,
                 price: PolymarketWireDecimalV2::parse(&self.price)?,
@@ -934,17 +975,24 @@ impl WireOrder {
 #[serde(deny_unknown_fields)]
 struct WireTrade {
     asset_id: String,
-    bucket_index: u64,
+    #[serde(default)]
+    bucket_index: Option<u64>,
     #[serde(default)]
     fee_rate_bps: Option<String>,
     id: String,
-    last_update: String,
-    maker_address: String,
-    maker_orders: BoundedVec<WireMaker, MAX_NESTED>,
+    #[serde(default)]
+    last_update: Option<String>,
+    #[serde(default)]
+    maker_address: Option<String>,
+    #[serde(default)]
+    maker_orders: Option<BoundedVec<WireMaker, MAX_NESTED>>,
     market: String,
-    #[serde(alias = "matchtime")]
-    match_time: String,
-    outcome: String,
+    #[serde(default)]
+    match_time: Option<String>,
+    #[serde(default)]
+    matchtime: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
     owner: String,
     price: String,
     side: String,
@@ -952,10 +1000,12 @@ struct WireTrade {
     status: String,
     taker_order_id: String,
     timestamp: String,
-    trade_owner: String,
+    #[serde(default)]
+    trade_owner: Option<String>,
     #[serde(default)]
     transaction_hash: Option<String>,
-    trader_side: String,
+    #[serde(default)]
+    trader_side: Option<String>,
     #[serde(rename = "type")]
     event: String,
 }
@@ -966,18 +1016,32 @@ impl WireTrade {
         account_address: &str,
         api_key: &str,
     ) -> Result<PolymarketUserEvidenceElementV2, PolymarketEvidenceV2Error> {
-        let maker_orders = self.maker_orders.into_vec();
+        let maker_orders = self
+            .maker_orders
+            .map(BoundedVec::into_vec)
+            .unwrap_or_default();
+        let maker_address = self
+            .maker_address
+            .unwrap_or_else(|| ABSENT_WIRE_TEXT.to_string());
+        let match_time = self
+            .match_time
+            .or(self.matchtime)
+            .ok_or(PolymarketEvidenceV2Error::InvalidField)?;
+        let last_update = self.last_update.unwrap_or_else(|| self.timestamp.clone());
+        let trader_side = self
+            .trader_side
+            .ok_or(PolymarketEvidenceV2Error::InvalidField)?;
+        let trade_owner_matches_api_key = self.trade_owner.as_deref() == Some(api_key);
         validate_many([
             self.asset_id.as_str(),
             self.id.as_str(),
-            self.last_update.as_str(),
-            self.maker_address.as_str(),
+            last_update.as_str(),
+            maker_address.as_str(),
             self.market.as_str(),
-            self.match_time.as_str(),
+            match_time.as_str(),
             self.taker_order_id.as_str(),
             self.timestamp.as_str(),
             self.owner.as_str(),
-            self.trade_owner.as_str(),
         ])?;
         validate_unsigned(&self.timestamp)?;
         let event = parse_event(&self.event)?;
@@ -991,7 +1055,7 @@ impl WireTrade {
         for maker in maker_orders {
             makers.push(maker.project(account_address, api_key)?);
         }
-        let outcome = validated_optional(self.outcome)?;
+        let outcome = self.outcome.map(validated_optional).transpose()?.flatten();
         let transaction_hash = match self.transaction_hash {
             Some(value) => validated_optional(value)?,
             None => None,
@@ -999,19 +1063,19 @@ impl WireTrade {
         Ok(PolymarketUserEvidenceElementV2::Trade(
             PolymarketTradeEvidenceV2 {
                 asset_id: self.asset_id,
-                bucket_index: self.bucket_index,
+                bucket_index: self.bucket_index.unwrap_or_default(),
                 fee_rate_bps: parse_optional_decimal(self.fee_rate_bps)?,
                 trade_id: self.id,
-                last_update: self.last_update,
-                maker_address: self.maker_address.clone(),
+                last_update,
+                maker_address: maker_address.clone(),
                 maker_rows: makers.into_boxed_slice(),
                 market: self.market,
-                match_time: self.match_time,
+                match_time,
                 outcome,
                 ownership: PolymarketTradeOwnershipV2 {
-                    maker_address_matches_account: self.maker_address == account_address,
+                    maker_address_matches_account: maker_address == account_address,
                     owner_matches_api_key: self.owner == api_key,
-                    trade_owner_matches_api_key: self.trade_owner == api_key,
+                    trade_owner_matches_api_key,
                 },
                 price: PolymarketWireDecimalV2::parse(&self.price)?,
                 side: parse_side(&self.side)?,
@@ -1020,7 +1084,7 @@ impl WireTrade {
                 taker_order_id: self.taker_order_id,
                 timestamp: self.timestamp,
                 transaction_hash,
-                role: parse_role(&self.trader_side)?,
+                role: parse_role(&trader_side)?,
                 event,
             },
         ))
@@ -1033,10 +1097,14 @@ struct WireMaker {
     asset_id: String,
     #[serde(default)]
     fee_rate_bps: Option<String>,
-    maker_address: String,
+    #[serde(default)]
+    maker_address: Option<String>,
     matched_amount: String,
     order_id: String,
-    outcome: String,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default, rename = "outcome_index")]
+    _outcome_index: Option<u64>,
     owner: String,
     price: String,
     #[serde(default)]
@@ -1049,21 +1117,24 @@ impl WireMaker {
         account_address: &str,
         api_key: &str,
     ) -> Result<PolymarketMakerEvidenceV2, PolymarketEvidenceV2Error> {
+        let maker_address = self
+            .maker_address
+            .unwrap_or_else(|| ABSENT_WIRE_TEXT.to_string());
         validate_many([
             self.asset_id.as_str(),
-            self.maker_address.as_str(),
+            maker_address.as_str(),
             self.order_id.as_str(),
             self.owner.as_str(),
         ])?;
-        let outcome = validated_optional(self.outcome)?;
+        let outcome = self.outcome.map(validated_optional).transpose()?.flatten();
         Ok(PolymarketMakerEvidenceV2 {
             asset_id: self.asset_id,
-            maker_address: self.maker_address.clone(),
+            maker_address: maker_address.clone(),
             matched_amount: PolymarketWireDecimalV2::parse(&self.matched_amount)?,
             order_id: self.order_id,
             outcome,
             ownership: PolymarketMakerOwnershipV2 {
-                maker_address_matches_account: self.maker_address == account_address,
+                maker_address_matches_account: maker_address == account_address,
                 owner_matches_api_key: self.owner == api_key,
             },
             price: PolymarketWireDecimalV2::parse(&self.price)?,
@@ -1923,6 +1994,41 @@ mod tests {
             current.to_dispatch_messages(),
             legacy.to_dispatch_messages()
         );
+    }
+
+    #[test]
+    fn current_nullable_trade_fields_project_without_minting_ownership() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fixture("ws_user_trade.json")).unwrap();
+        value["event_type"] = serde_json::json!("trade");
+        value["trade_owner"] = serde_json::Value::Null;
+        value["maker_address"] = serde_json::Value::Null;
+        value["last_update"] = serde_json::Value::Null;
+        value["bucket_index"] = serde_json::Value::Null;
+        value["outcome"] = serde_json::Value::Null;
+        value["maker_orders"][0]["maker_address"] = serde_json::Value::Null;
+        value["maker_orders"][0]["outcome"] = serde_json::Value::Null;
+        value["maker_orders"][0]["outcome_index"] = serde_json::json!(1);
+
+        let frame = PolymarketAuthenticatedUserFrameV2::project(
+            &serde_json::to_string(&value).unwrap(),
+            2,
+            1,
+            ACCOUNT,
+            API_KEY,
+        )
+        .unwrap();
+        let PolymarketUserEvidenceElementV2::Trade(trade) = &frame.elements()[0] else {
+            panic!("expected trade");
+        };
+        assert!(!trade.ownership().maker_address_matches_account());
+        assert!(!trade.ownership().trade_owner_matches_api_key());
+        assert!(
+            !trade.maker_rows()[0]
+                .ownership()
+                .maker_address_matches_account()
+        );
+        assert!(frame.to_dispatch_messages().is_ok());
     }
 
     #[test]
