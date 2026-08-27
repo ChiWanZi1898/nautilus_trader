@@ -66,6 +66,8 @@ pub struct PolymarketFrameCommit {
     affected_instrument_ids: Vec<InstrumentId>,
     ts_event: UnixNanos,
     ts_init: UnixNanos,
+    #[serde(default)]
+    book_apply_elapsed_ns: u64,
 }
 
 impl PolymarketFrameCommit {
@@ -76,6 +78,7 @@ impl PolymarketFrameCommit {
         affected_instrument_ids: Vec<InstrumentId>,
         ts_event: UnixNanos,
         ts_init: UnixNanos,
+        book_apply_elapsed_ns: u64,
     ) -> Self {
         debug_assert!(frame_id > 0);
         debug_assert!(connection_generation > 0);
@@ -93,6 +96,7 @@ impl PolymarketFrameCommit {
             affected_instrument_ids,
             ts_event,
             ts_init,
+            book_apply_elapsed_ns,
         }
     }
 
@@ -124,6 +128,15 @@ impl PolymarketFrameCommit {
     #[must_use]
     pub const fn ts_event(&self) -> UnixNanos {
         self.ts_event
+    }
+
+    /// Returns adapter time from decoded frame dispatch through book application and publication.
+    ///
+    /// This excludes network transit and WebSocket decoding, and ends immediately before the
+    /// frame commit enters the shared data-event FIFO.
+    #[must_use]
+    pub const fn book_apply_elapsed_ns(&self) -> u64 {
+        self.book_apply_elapsed_ns
     }
 }
 

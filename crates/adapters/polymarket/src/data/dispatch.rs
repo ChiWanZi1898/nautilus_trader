@@ -386,6 +386,11 @@ fn emit_l2_frame(
         }
     }
 
+    let book_apply_elapsed_ns = ctx
+        .clock
+        .get_time_ns()
+        .as_u64()
+        .saturating_sub(ts_init.as_u64());
     let commit = PolymarketFrameCommit::new(
         frame_id,
         source.shard_id,
@@ -393,6 +398,7 @@ fn emit_l2_frame(
         affected_instrument_ids,
         ts_event,
         ts_init,
+        book_apply_elapsed_ns,
     );
     let custom = NautilusCustomData::from_arc(Arc::new(commit));
     if let Err(e) = ctx
@@ -4422,6 +4428,7 @@ mod tests {
         let commit = frame_commit(&events[2]).expect("frame commit after snapshot readiness");
         assert_eq!(commit.frame_id(), 1);
         assert_eq!(commit.affected_instrument_ids(), &[instrument_id]);
+        assert!(commit.book_apply_elapsed_ns() > 0);
     }
 
     #[rstest]
