@@ -2624,6 +2624,32 @@ async fn test_fetch_gamma_events_stops_at_total_cap() {
 
 #[rstest]
 #[tokio::test]
+async fn test_event_definitions_and_instruments_share_one_gamma_fetch() {
+    let state = TestServerState::default();
+    let market = gamma_market_with_slug(
+        "joined-event-market",
+        "0xcondition_joined_event",
+        ["98250000000000000001", "98250000000000000002"],
+    );
+    state.gamma_events_pages.lock().await.push_back(json!({
+        "events": [gamma_event_with_markets("joined-event", &[market])],
+    }));
+    let addr = start_mock_server(state.clone()).await;
+    let client = create_gamma_domain_client(&addr);
+
+    let (definitions, instruments) = client
+        .request_event_definitions_with_instruments_by_params(GetGammaEventsParams::default())
+        .await
+        .unwrap();
+
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].event_id(), "evt-test-001");
+    assert_eq!(instruments.len(), 2);
+    assert_eq!(state.gamma_events_query_log.lock().await.len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_fetch_gamma_events_rejects_repeated_cursor() {
     let state = TestServerState::default();
     let market = gamma_market_with_slug(

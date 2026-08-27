@@ -13,7 +13,7 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::Context;
 use futures_util::{StreamExt, stream};
@@ -32,7 +32,9 @@ use nautilus_core::{Params, datetime::datetime_to_unix_nanos};
 use nautilus_model::{data::CustomData, instruments::Instrument};
 
 use super::{
-    PolymarketDataClient, dispatch::WsMessageContext, instruments::cache_instrument_if_active,
+    PolymarketDataClient,
+    dispatch::WsMessageContext,
+    instruments::{cache_instrument_if_active, cache_instruments_if_active},
 };
 use crate::{
     common::consts::POLYMARKET_VENUE,
@@ -393,6 +395,8 @@ fn request_event_definition_snapshot(client: &PolymarketDataClient, request: Req
     } = request;
     let gamma_client = client.provider.http_client().clone();
     let sender = client.data_sender.clone();
+    let instruments_cache = client.instruments.clone();
+    let token_meta = client.token_meta.clone();
     let clock = client.clock;
     let start_nanos = datetime_to_unix_nanos(start);
     let end_nanos = datetime_to_unix_nanos(end);
@@ -406,17 +410,31 @@ fn request_event_definition_snapshot(client: &PolymarketDataClient, request: Req
             max_events: Some(10_001),
             ..Default::default()
         };
-        let definitions = match gamma_client
-            .request_event_definitions_by_params(params)
+        let (definitions, instruments) = match gamma_client
+            .request_event_definitions_with_instruments_by_params(params)
             .await
         {
-            Ok(definitions) => definitions,
+            Ok(result) => result,
             Err(error) => {
                 log::error!("Failed to request complete Polymarket event definitions: {error}");
                 return;
             }
         };
         let ts_now = clock.get_time_ns();
+        let previously_cached = instruments_cache
+            .load()
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let active_instruments = cache_instruments_if_active(
+            ts_now,
+            &instruments_cache,
+            &token_meta,
+            instruments,
+        )
+        .into_iter()
+        .filter(|instrument| !previously_cached.contains(&instrument.id()))
+        .collect::<Vec<_>>();
         let snapshot = match PolymarketEventDefinitionSnapshot::try_new(definitions, ts_now) {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -439,7 +457,18 @@ fn request_event_definition_snapshot(client: &PolymarketDataClient, request: Req
         ));
         if let Err(error) = sender.send(DataEvent::Response(response)) {
             log::error!("Failed to send Polymarket event definition snapshot: {error}");
+            return;
         }
+        let published = active_instruments.len();
+        for instrument in active_instruments {
+            if let Err(error) = sender.send(DataEvent::Instrument(instrument)) {
+                log::error!("Failed to publish snapshot-hydrated Polymarket instrument: {error}");
+                return;
+            }
+        }
+        log::debug!(
+            "Hydrated the complete Polymarket event snapshot and published {published} new instruments"
+        );
     });
 }
 

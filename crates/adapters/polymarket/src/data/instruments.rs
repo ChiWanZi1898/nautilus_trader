@@ -69,6 +69,41 @@ pub(super) fn cache_instrument_if_active(
     true
 }
 
+/// Caches one discovery batch with a single copy-on-write map update.
+///
+/// Calling [`cache_instrument_if_active`] once per member makes `AtomicMap::insert` clone the
+/// complete map for every instrument. Event-wide discovery contains thousands of instruments, so
+/// that quadratic path can delay the event snapshot long enough to trigger a false timeout.
+pub(super) fn cache_instruments_if_active(
+    now_ns: UnixNanos,
+    instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
+    instruments: Vec<InstrumentAny>,
+) -> Vec<InstrumentAny> {
+    let active = instruments
+        .into_iter()
+        .filter(|instrument| !is_instrument_expired(instrument, now_ns))
+        .collect::<Vec<_>>();
+
+    instruments_cache.rcu(|cache| {
+        for instrument in &active {
+            cache.insert(instrument.id(), instrument.clone());
+        }
+    });
+    for instrument in &active {
+        token_meta.insert(
+            Ustr::from(instrument.raw_symbol().as_str()),
+            TokenMeta {
+                instrument_id: instrument.id(),
+                price_precision: instrument.price_precision(),
+                size_precision: instrument.size_precision(),
+            },
+        );
+    }
+
+    active
+}
+
 pub(super) fn cache_and_publish_instruments(
     instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
@@ -76,20 +111,10 @@ pub(super) fn cache_and_publish_instruments(
     now_ns: UnixNanos,
     instruments: Vec<InstrumentAny>,
 ) -> usize {
-    let mut total = 0;
-
-    for instrument in instruments {
-        if !cache_instrument_if_active(now_ns, instruments_cache, token_meta, &instrument) {
-            log::debug!(
-                "Skipping expired instrument {} during live cache publish",
-                instrument.id()
-            );
-            continue;
-        }
-
+    let active = cache_instruments_if_active(now_ns, instruments_cache, token_meta, instruments);
+    let total = active.len();
+    for instrument in active {
         let instrument_id = instrument.id();
-        total += 1;
-
         if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
             log::warn!("Failed to publish instrument {instrument_id}: {e}");
         }
@@ -333,6 +358,33 @@ mod tests {
                 .get(&token_id)
                 .unwrap_or_else(|| panic!("missing token_meta for {token_id}"));
             assert_eq!(meta.instrument_id, inst.id());
+        }
+    }
+
+    #[rstest]
+    fn cache_instruments_batches_the_dual_cache_update() {
+        let instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>> = Arc::new(AtomicMap::new());
+        let token_meta: Arc<DashMap<Ustr, TokenMeta>> = Arc::new(DashMap::new());
+        let samples = vec![
+            stub_instrument("bulk-token-1", Price::from("0.01"), Quantity::from("0.1")),
+            stub_instrument("bulk-token-2", Price::from("0.001"), Quantity::from("0.01")),
+        ];
+
+        let active =
+            cache_instruments_if_active(UnixNanos::new(1), &instruments, &token_meta, samples);
+
+        assert_eq!(active.len(), 2);
+        assert_eq!(instruments.load().len(), 2);
+        assert_eq!(token_meta.len(), 2);
+        for instrument in active {
+            let token_id = Ustr::from(instrument.raw_symbol().as_str());
+            assert_eq!(
+                token_meta
+                    .get(&token_id)
+                    .expect("bulk token metadata")
+                    .instrument_id,
+                instrument.id()
+            );
         }
     }
 }

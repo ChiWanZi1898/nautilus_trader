@@ -965,7 +965,26 @@ impl PolymarketGammaHttpClient {
         &self,
         params: GetGammaEventsParams,
     ) -> anyhow::Result<Vec<PolymarketEventDefinition>> {
+        let (definitions, _) = self
+            .request_event_definitions_with_instruments_by_params(params)
+            .await?;
+        Ok(definitions)
+    }
+
+    /// Fetches complete event containers once and returns both their canonical event definitions
+    /// and the instruments embedded in those same containers.
+    ///
+    /// This is used by event-wide discovery so its first complete snapshot can hydrate the data
+    /// client's instrument cache without scheduling a second Gamma request for every subsequent
+    /// order-book subscription.
+    pub async fn request_event_definitions_with_instruments_by_params(
+        &self,
+        params: GetGammaEventsParams,
+    ) -> anyhow::Result<(Vec<PolymarketEventDefinition>, Vec<InstrumentAny>)> {
         let events = self.fetch_gamma_events_paginated(params).await?;
+        let ts_init = self.clock.get_time_ns();
+        let instruments =
+            parse_markets_to_instruments(&flatten_event_markets(events.clone()), ts_init);
         let mut definitions = events
             .into_iter()
             .filter_map(|event| {
@@ -988,7 +1007,7 @@ impl PolymarketGammaHttpClient {
                 .all(|events| events[0].event_id() != events[1].event_id()),
             "Gamma returned duplicate event identifiers",
         );
-        Ok(definitions)
+        Ok((definitions, instruments))
     }
 
     /// Searches for instruments via the Gamma public search endpoint.

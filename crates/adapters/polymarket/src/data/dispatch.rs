@@ -2925,6 +2925,45 @@ mod tests {
                 .windows(2)
                 .all(|markets| { markets[0].condition_id() < markets[1].condition_id() })
         );
+        assert_eq!(client.instruments.load().len(), 4);
+        assert_eq!(client.token_meta.len(), 4);
+        let response_position = events
+            .iter()
+            .position(|event| matches!(event, DataEvent::Response(_)))
+            .expect("event definition response position");
+        let instrument_position = events
+            .iter()
+            .position(|event| matches!(event, DataEvent::Instrument(_)))
+            .expect("snapshot-hydrated instrument position");
+        assert!(
+            response_position < instrument_position,
+            "the control-plane snapshot must be queued before its bulk instrument publications"
+        );
+
+        let refresh = RequestCustomData::new(
+            ClientId::from("POLYMARKET"),
+            DataType::new(POLYMARKET_EVENT_DEFINITION_SNAPSHOT_TYPE_NAME, None, None),
+            None,
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        client.request_data(refresh).expect("refresh request_data");
+        let refresh_events =
+            collect_events_until(&mut data_rx, StdDuration::from_secs(2), |events| {
+                events
+                    .iter()
+                    .any(|event| matches!(event, DataEvent::Response(_)))
+            })
+            .await;
+        assert!(
+            refresh_events
+                .iter()
+                .all(|event| !matches!(event, DataEvent::Instrument(_))),
+            "an unchanged event refresh must not republish cached instruments"
+        );
     }
 
     #[rstest]
